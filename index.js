@@ -81,39 +81,40 @@ export const inject = ['agents', 'fs', 'systemPrompt'];
  */
 export function apply(ctx, config = {}) {
 	const cfg = resolveConfig(config, warn);
-	/** Sessions this plugin drives, keyed by Session id. */
-	const states = new Map();
-	const disposers = new Map();
+	/**
+	 * Live wiring per agent *runtime*, keyed by the Agent itself rather than by
+	 * its Session id: a session can be handed a new runtime (and the old one
+	 * disposed) while this plugin is mounted, and a stale key must neither block
+	 * the new runtime's wiring nor tear it down.
+	 */
+	const wired = new Map();
 	let unloading = false;
 
 	/**
-	 * Drop everything this plugin registered for one session.
-	 * @param sessionId - session whose per-agent registrations are released.
+	 * Release one runtime's wiring and forget it.
+	 * @param agent - the exact agent runtime whose registrations are dropped.
 	 */
-	const release = (sessionId) => {
-		const dispose = disposers.get(sessionId);
-		disposers.delete(sessionId);
-		if (dispose !== undefined) {
-			try {
-				dispose();
-			} catch (error) {
-				warn(`could not release session registrations: ${describe(error)}`);
-			}
+	const unwire = (agent) => {
+		const entry = wired.get(agent);
+		if (entry === undefined) return;
+		wired.delete(agent);
+		entry.state.closed = true;
+		// Cancels a pending question, a retry sleep, and in-flight file I/O, so a
+		// runtime that is going away can no longer write anything.
+		entry.state.controller.abort(new Error('session wiring released'));
+		try {
+			entry.dispose();
+		} catch (error) {
+			warn(`could not release session registrations: ${describe(error)}`);
 		}
-		const state = states.get(sessionId);
-		if (state === undefined) return;
-		states.delete(sessionId);
-		state.closed = true;
-		// Cancels a pending question, a retry sleep, and in-flight file I/O.
-		state.controller.abort(new Error('session closed'));
 	};
 
 	ctx.effect(() => () => {
 		unloading = true;
-		for (const sessionId of [...disposers.keys()]) release(sessionId);
+		for (const agent of [...wired.keys()]) unwire(agent);
 	}, 'current-progress: per-session registrations');
 
-	ctx.on('agent/disposed', ({ agent }) => release(agent.id));
+	ctx.on('agent/disposed', ({ agent }) => unwire(agent));
 	ctx.on('agent/created', ({ agent, source }) => {
 		void attach(agent, source).catch((error) => {
 			warn(`session setup failed: ${describe(error)}`);
@@ -145,7 +146,13 @@ export function apply(ctx, config = {}) {
 			trace(cfg, agent.id, 'attach skipped: not a runtime root');
 			return;
 		}
-		if (states.has(agent.id)) return;
+		if (wired.has(agent)) return;
+		// A newer runtime for the same session supersedes an older one.
+		for (const [other, entry] of wired) {
+			if (other.id !== agent.id) continue;
+			trace(cfg, agent.id, 'superseding an older runtime of the same session');
+			unwire(other);
+		}
 		const cwd = agent.session?.header?.cwd;
 		if (typeof cwd !== 'string' || cwd.length === 0) {
 			warn(`session "${agent.id}" has no working directory; skipping ${cfg.fileName}`);
@@ -166,48 +173,16 @@ export function apply(ctx, config = {}) {
 			createdAt: undefined,
 			/** Contributed to the runtime context snapshot; empty contributes nothing. */
 			contextText: '',
+			/** Last context text reported to the trace, so the trace shows participation. */
+			tracedContext: undefined,
 			/** Fold of the turn currently being driven. */
 			current: null,
 			lastTurn: 0
 		};
-		states.set(agent.id, state);
+		const entry = { state, dispose: () => {} };
+		wired.set(agent, entry);
 		trace(cfg, agent.id, `attach source=${source} cwd=${cwd}`);
-
-		const dispose = agent.ctx.effect(() => {
-			const offs = [
-				agent.ctx.on('session/event', (session, event) => {
-					if (session !== state.session) return;
-					try {
-						fold(state, event);
-					} catch (error) {
-						warn(`session fold failed: ${describe(error)}`);
-					}
-				}),
-				agent.ctx.on('agent/turn-stopping', (payload) => {
-					try {
-						return recordTurn(ctx, state, payload);
-					} catch (error) {
-						warn(`could not append a turn entry: ${describe(error)}`);
-						return undefined;
-					}
-				}),
-				agent.ctx.systemPrompt.context({
-					name: CONTEXT_NAME,
-					order: CONTEXT_ORDER,
-					text: () => state.contextText
-				})
-			];
-			return () => {
-				for (const off of offs) {
-					try {
-						off();
-					} catch (error) {
-						warn(`could not remove a session registration: ${describe(error)}`);
-					}
-				}
-			};
-		}, 'current-progress: session wiring');
-		disposers.set(agent.id, dispose);
+		entry.dispose = wire(ctx, agent, state, warn);
 		trace(cfg, agent.id, 'listeners + context registered');
 
 		await startup(ctx, state);
@@ -221,6 +196,72 @@ export function apply(ctx, config = {}) {
 			/* logging must never break a session */
 		}
 	}
+}
+
+/**
+ * Register one runtime's per-agent behaviour on its own scope, so agent
+ * disposal removes it.
+ *
+ * Each registration is isolated: a failing one (for example a prompt-context
+ * name already held in that scope by a previous, not-yet-unwound generation)
+ * must not roll back the others, or the plugin would silently stop observing a
+ * session it had already adopted.
+ *
+ * @param ctx - Host plugin context.
+ * @param agent - the exact agent runtime being wired.
+ * @param state - that runtime's state.
+ * @param warn - plugin logger.
+ * @returns the disposer of every registration made here.
+ */
+function wire(ctx, agent, state, warn) {
+	const offs = [];
+	const attempt = (label, register) => {
+		try {
+			const off = register();
+			if (typeof off === 'function') offs.push(off);
+		} catch (error) {
+			warn(`could not register the ${label} for session "${state.sessionId}": ${describe(error)}`);
+			trace(state.cfg, state.sessionId, `${label} registration failed: ${describe(error)}`);
+		}
+	};
+	return agent.ctx.effect(() => {
+		attempt('session event listener', () => agent.ctx.on('session/event', (session, event) => {
+			if (session !== state.session) return;
+			try {
+				fold(state, event);
+			} catch (error) {
+				warn(`session fold failed: ${describe(error)}`);
+			}
+		}));
+		attempt('turn-stopping listener', () => agent.ctx.on('agent/turn-stopping', (payload) => {
+			try {
+				return recordTurn(ctx, state, payload);
+			} catch (error) {
+				warn(`could not append a turn entry: ${describe(error)}`);
+				return undefined;
+			}
+		}));
+		attempt('prompt context', () => agent.ctx.systemPrompt.context({
+			name: CONTEXT_NAME,
+			order: CONTEXT_ORDER,
+			text: () => {
+				if (state.tracedContext !== state.contextText) {
+					state.tracedContext = state.contextText;
+					trace(state.cfg, state.sessionId, `context provider ran: ${state.contextText.length} chars`);
+				}
+				return state.contextText;
+			}
+		}));
+		return () => {
+			for (const off of offs.splice(0)) {
+				try {
+					off();
+				} catch (error) {
+					warn(`could not remove a session registration: ${describe(error)}`);
+				}
+			}
+		};
+	}, 'current-progress: session wiring');
 }
 
 /**

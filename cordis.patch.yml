@@ -26,3 +26,5 @@
         maxAskChars: 1200
         maxResultChars: 2400
         maxToolLines: 20
+        # Diagnostics: append one line per decision to this file (unset = off).
+        traceFile: /Users/jwalr/.dsh/plugins/current-progress/trace.log

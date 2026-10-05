@@ -125,9 +125,25 @@ function harness({ initial = {}, answer = 'yes', ask = true, askService = true, 
 			listener(session, { type, seq: 0, time, data });
 		}
 	};
+	/** Dispatch one plugin-level event (`agent/created`, `agent/disposed`, …). */
+	const emitGlobal = (event, payload) => {
+		for (const listener of listeners.get(event) ?? []) listener(payload);
+	};
 
 	apply(ctx, { fileName: 'CURRENT_PROGRESS.md', askAttemptsMs: [0], askTimeoutMs: 500, ...config, ask });
-	return { ctx, agent, session, files, log, contexts, emit, feed, get askCount() { return askCount; }, listeners };
+	return {
+		ctx,
+		agent,
+		session,
+		files,
+		log,
+		contexts,
+		emit,
+		feed,
+		emitGlobal,
+		get askCount() { return askCount; },
+		listeners
+	};
 }
 
 const tick = (ms = 30) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -264,6 +280,65 @@ if (process.argv.includes('--dump')) {
 	await h.emit('agent/turn-stopping', { turn: 1 });
 	await tick(5);
 	console.log(`\n---SAMPLE FILE---\n${h.files.get('/ws/CURRENT_PROGRESS.md')}---END SAMPLE---`);
+}
+
+// 9. A disposed runtime stops observing at once, and the runtime that follows
+//    it for the same session is wired again instead of being blocked by a stale
+//    session key.
+{
+	const existing = '<!-- current-progress: {"version":1,"createdAt":"2026-01-01T00:00:00.000Z"} -->\n# Current Progress\n\n## Entries\n';
+	const h = harness({ initial: { '/ws/CURRENT_PROGRESS.md': existing } });
+	await tick();
+	check('handover: existing file arms without asking', h.askCount === 0 && h.log.length === 0, h.log.join('|'));
+
+	h.emitGlobal('agent/disposed', { agent: h.agent });
+	h.feed('turn/start', { turn: 9 });
+	h.feed('assistant/message', { turn: 9, step: 1, message: { id: 'a', role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text: 'stale runtime' }] } });
+	await h.emit('agent/turn-stopping', { turn: 9 });
+	await tick(5);
+	check('handover: a disposed runtime writes nothing', !h.files.get('/ws/CURRENT_PROGRESS.md').includes('session-1:9'));
+
+	h.emitGlobal('agent/created', { agent: h.agent, source: 'resume' });
+	await tick();
+	h.feed('turn/start', { turn: 10 });
+	h.feed('user/message', userMessage('after the handover'));
+	h.feed('assistant/message', { turn: 10, step: 1, message: { id: 'a2', role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text: 'handled' }] } });
+	await h.emit('agent/turn-stopping', { turn: 10 });
+	await tick(5);
+	const text = h.files.get('/ws/CURRENT_PROGRESS.md');
+	check('handover: the new runtime records its turn', text.includes('session-1:10'), text.split('\n').filter((l) => l.includes('entry id')).join('|'));
+}
+
+// 10. A registration that collides (a stale prompt context left in the agent's
+//     scope) must not silently kill the listeners.
+{
+	const h = harness();
+	await tick();
+	let collisions = 0;
+	// Occupy the plugin's context name in the same scope, then re-create the
+	// runtime so the plugin wires itself again while the name is taken.
+	h.ctx.agents.roots = () => [h.agent];
+	h.emitGlobal('agent/disposed', { agent: h.agent });
+	const occupied = [];
+	const realContext = h.agent.ctx.systemPrompt.context;
+	h.agent.ctx.systemPrompt.context = (contribution) => {
+		if (contribution.name === 'current-progress:file') {
+			collisions += 1;
+			throw new Error('prompt context "current-progress:file" is already registered in this scope');
+		}
+		return realContext(contribution);
+	};
+	h.emitGlobal('agent/created', { agent: h.agent, source: 'resume' });
+	await tick();
+	h.agent.ctx.systemPrompt.context = realContext;
+	check('collision: the context registration was attempted', collisions === 1, `collisions=${collisions}`);
+	check('collision: the failure is logged, not swallowed', h.log.some((line) => line.includes('prompt context')), h.log.join('|'));
+
+	h.feed('turn/start', { turn: 1 });
+	h.feed('user/message', userMessage('still recording?'));
+	await h.emit('agent/turn-stopping', { turn: 1 });
+	await tick(5);
+	check('collision: the listeners still record the turn', h.files.get('/ws/CURRENT_PROGRESS.md').includes('session-1:1'));
 }
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`);
