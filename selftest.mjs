@@ -418,7 +418,7 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 	}
 	const text = h.files.get('/ws/CURRENT_PROGRESS.md');
 	check('the header says what the file is', /_What happened in this directory/u.test(text));
-	check('the header counts the retained turns', text.includes('the last 3 turns in this directory'), text.split('\n')[3] ?? '');
+	check('the header counts the retained turns', text.includes('the last 3 turns here'), text.split('\n')[3] ?? '');
 	check('the header says how far the work got', text.includes('- **Entries**: 3 (through turn 5)'), text.split('\n').find((l) => l.includes('Entries')) ?? '');
 }
 

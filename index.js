@@ -797,14 +797,14 @@ function renderFile({ fileName, dir, createdAt, entries }) {
 	const ascending = entries.every((entry, index) => index === 0
 		|| (typeof entry.turn === 'number' && typeof entries[index - 1].turn === 'number' && entry.turn > entries[index - 1].turn));
 	const covered = sameSession
-		? `the last ${entries.length} turn${entries.length === 1 ? '' : 's'} in this directory`
-		: `the most recent ${entries.length} turns recorded in this directory`;
+		? `the last ${entries.length} turn${entries.length === 1 ? '' : 's'} here`
+		: `the most recent ${entries.length} turns recorded here`;
 	const reach = sameSession && ascending && furthest !== undefined ? ` (through turn ${furthest})` : '';
 	const lines = [
 		`<!-- current-progress: ${JSON.stringify({ version: 1, createdAt })} -->`,
 		`# ${titleOf(fileName)}`,
 		'',
-		`_What happened in this directory: ${covered}. Each entry records the summary, what it left behind, what failed, and what was still open; nothing here is edited by hand._`,
+		`_What happened in this directory — ${covered}. Each entry records the summary, what it left behind, what failed, and what was still open; nothing here is edited by hand._`,
 		'',
 		`- **Directory**: \`${dir}\``,
 		`- **Started**: ${formatTime(createdAt)}`,

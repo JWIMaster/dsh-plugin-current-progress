@@ -194,7 +194,7 @@ three turns left off.
 <!-- current-progress: {"version":1,"createdAt":"2026-10-05T09:59:52.904Z"} -->
 # Current Progress
 
-_Handover note maintained by the DSH `current-progress` plugin: these are the last 3 turns in this directory. Read it to see what was done and where it stopped; nothing here is edited by hand._
+_What happened in this directory — the last 3 turns here. Each entry records the summary, what it left behind, what failed, and what was still open; nothing here is edited by hand._
 
 - **Directory**: `/path/to/dir`
 - **Started**: 2026-10-05 20:59 GMT+11
@@ -205,28 +205,21 @@ _Handover note maintained by the DSH `current-progress` plugin: these are the la
 
 <!-- progress:entry id="<session>:12" -->
 ### Turn 12 · 2026-10-05 21:34 GMT+11
+Query: the card looks bad and the file is huge — fix both, then publish
 
-**Asked**
-> the card looks bad and the file is huge — fix both, then publish
+Summary: Reworked the card copy and capped the file at three compact turns.
+·
+The publish is unfinished: it needs a one-time password, so the build is pushed
+but not on the registry.
 
-**Done**
-> Reworked the card copy and capped the file at three compact turns.
->
-> ·
->
-> The publish is unfinished: it needs a one-time password, so the build is
-> pushed but not on the registry.
+Done: `src/Header.tsx`, `src/Card.tsx` · ran npm test
 
-**Changed**
-- **Edited** `src/Header.tsx` ×2
-- **Ran** npm test — run the offline suite
+Failed:
+- `bash` npm publish — one-time password required
 
-**Failed**
-- **Ran** npm publish — _one-time password required_
-
-**Also**
-- **Read** `src/Header.tsx`
-- **Searched** maxEntries
+To go:
+- Publish 1.3.0 _(in progress)_
+- Re-check the card in a directory without a progress file
 <!-- /progress:entry -->
 ```
 
