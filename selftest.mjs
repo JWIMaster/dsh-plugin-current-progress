@@ -291,7 +291,67 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 	check('retention keeps only the newest', JSON.stringify(ids) === JSON.stringify(['session-1:2', 'session-1:3']), ids.join(','));
 }
 
-// 8. A marker-looking result cannot break the file structure.
+// 8. By default only the last three turns are kept, and the file stays small.
+{
+	const h = harness();
+	await tick();
+	for (const turn of [1, 2, 3, 4, 5]) {
+		h.feed('turn/start', { turn });
+		h.feed('user/message', userMessage(`ask ${turn}`));
+		h.feed('tool/call', { turn, step: 1, callId: `c${turn}`, name: 'bash', arguments: JSON.stringify({ command: `run the ${turn}th thing with a deliberately long command line that should be clipped rather than stored in full` }) });
+		h.feed('assistant/message', { turn, step: 1, message: { id: `a${turn}`, role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text: `Finished ${turn}.` }] } });
+		await h.emit('agent/turn-stopping', { turn });
+		await tick(2);
+	}
+	const text = h.files.get('/ws/CURRENT_PROGRESS.md');
+	const ids = [...text.matchAll(/progress:entry id="([^"]+)"/gu)].map((m) => m[1]);
+	check('default retention keeps exactly three turns', JSON.stringify(ids) === JSON.stringify(['session-1:3', 'session-1:4', 'session-1:5']), ids.join(','));
+	check('the header counts what survived', text.includes('- **Entries**: 3'), text.split('\n').find((l) => l.includes('Entries')) ?? '');
+	check('the header says how many turns it holds', /the last 3 turns/u.test(text));
+	check('five turns fit well under the byte cap', Buffer.byteLength(text, 'utf8') < 4096, `${Buffer.byteLength(text, 'utf8')} bytes`);
+	check('tool details are clipped to one short line', text.split('\n').filter((l) => l.startsWith('- `bash`')).every((l) => l.length < 120), text.split('\n').find((l) => l.startsWith('- `bash`')) ?? '');
+	check('a repeat count is compact', text.includes('×2') === false || /×\d/u.test(text));
+	check('no label shares its line with a quote marker', !/^\*\*(Asked|Result)\*\* >/mu.test(text));
+	check('paragraph breaks are marked, not blank', text.includes('\n>\n') === false || text.includes('>\n> ·\n>'), JSON.stringify(text.split('\n').slice(-6)));
+}
+
+// 9. A verbose file left by an older version is compacted on the next write.
+{
+	const verbose = (id, turn, filler) => `<!-- progress:entry id="${id}" -->\n### Turn ${turn} · earlier\n\n**Asked**\n\n> ${filler}\n\n**Tools**\n\n- \`read\` — \`src/${turn}.js\`\n\n**Result**\n\n> ${filler}\n<!-- /progress:entry -->`;
+	const existing = `<!-- current-progress: {"version":1,"createdAt":"2026-01-01T00:00:00.000Z"} -->\n# Current Progress\n\n## Entries\n\n${[1, 2, 3, 4, 5].map((t) => verbose(`old:${t}`, t, 'x'.repeat(400))).join('\n\n')}\n`;
+	const h = harness({ initial: { '/ws/CURRENT_PROGRESS.md': existing } });
+	await tick();
+	h.feed('turn/start', { turn: 9 });
+	h.feed('user/message', userMessage('come back to this directory'));
+	h.feed('assistant/message', { turn: 9, step: 1, message: { id: 'a9', role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text: 'Picked it up.' }] } });
+	await h.emit('agent/turn-stopping', { turn: 9 });
+	await tick(5);
+	const text = h.files.get('/ws/CURRENT_PROGRESS.md');
+	const ids = [...text.matchAll(/progress:entry id="([^"]+)"/gu)].map((m) => m[1]);
+	check('an over-long file is trimmed to the newest three', JSON.stringify(ids) === JSON.stringify(['old:4', 'old:5', 'session-1:9']), ids.join(','));
+	check('the merged file is small', Buffer.byteLength(text, 'utf8') < 4096, `${Buffer.byteLength(text, 'utf8')} bytes`);
+	check('the original creation stamp survives', text.includes('"createdAt":"2026-01-01T00:00:00.000Z"'));
+
+	// A second write of the same turn must refresh that entry, not duplicate it.
+	await h.emit('agent/turn-stopping', { turn: 9 });
+	await tick(5);
+	const again = h.files.get('/ws/CURRENT_PROGRESS.md');
+	check('a repeated turn boundary still replaces', (again.match(/progress:entry id=/gu) ?? []).length === 3, `${(again.match(/progress:entry id=/gu) ?? []).length} entries`);
+}
+
+// 10. The injected context stays bounded, which is the point of the compaction.
+{
+	const filler = 'x'.repeat(3000);
+	const entry = (turn) => `<!-- progress:entry id="old:${turn}" -->\n### Turn ${turn} · earlier\n\n**Asked**\n> ${filler}\n\n**Result**\n> ${filler}\n<!-- /progress:entry -->`;
+	const existing = `<!-- current-progress: {"version":1,"createdAt":"2026-01-01T00:00:00.000Z"} -->\n# Current Progress\n\n## Entries\n\n${[1, 2, 3].map(entry).join('\n\n')}\n`;
+	const h = harness({ initial: { '/ws/CURRENT_PROGRESS.md': existing } });
+	await tick();
+	const injected = h.contexts[0]?.text() ?? '';
+	check('a huge existing file is clipped into context', injected.length <= 12288 + 400, `${injected.length} chars`);
+	check('the clipped block still closes its tag', injected.includes('</current-progress-file>'));
+}
+
+// 11. A marker-looking result cannot break the file structure.
 {
 	const h = harness();
 	await tick();

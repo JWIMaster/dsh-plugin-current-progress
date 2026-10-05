@@ -25,11 +25,12 @@ what was already done.
 4. **End of every turn.** At the `agent/turn-stopping` boundary — exactly where
    the model owes no further output — one entry is appended recording what was
    asked, which tools ran (with the path or command they touched, repeats
-   collapsed), and the assistant's closing text.
+   collapsed), and the assistant's closing text. Only the newest three turns are
+   kept; see [Compaction](#compaction) below.
 
-Compaction and cleared conversations neither re-ask nor re-read: they continue an
-existing session rather than starting one. Subagent children are ignored, because
-an owned child has no human answerer.
+Conversation compaction and cleared conversations neither re-ask nor re-read:
+they continue an existing session rather than starting one. Subagent children are
+ignored, because an owned child has no human answerer.
 
 ## Install
 
@@ -105,13 +106,35 @@ Every value in the patch row's `config` is optional.
 | `askAttemptsMs` | `[0, 300, 900, 2000, 4500, 9000]` | Retry schedule while no interactive answerer is attached yet. |
 | `injectExisting` | `true` | Contribute an existing file to the new session's context. |
 | `recordTurns` | `true` | Append one entry per finished turn. |
-| `maxEntries` | `100` | Retention: newest entries win. |
-| `maxFileBytes` | `131072` | Trim oldest entries until the file fits. |
-| `maxReadBytes` | `65536` | How much of an existing file to read into context. |
-| `maxAskChars` | `1200` | Per-message truncation for recorded user input. |
-| `maxResultChars` | `2400` | Per-message truncation for the recorded closing text. |
-| `maxToolLines` | `20` | Tool lines per entry before the list is summarised. |
+| `maxEntries` | `3` | Retention: only this many of the newest turns are kept. |
+| `maxFileBytes` | `16384` | Trim oldest entries until the file fits. |
+| `maxReadBytes` | `12288` | How much of an existing file to read into context. |
+| `maxAskChars` | `400` | Per-message truncation for recorded user input. |
+| `maxResultChars` | `700` | Per-message truncation for the recorded closing text. |
+| `maxToolLines` | `8` | Tool lines per entry before the list is summarised. |
+| `maxToolDetailChars` | `72` | Truncation for the command, pattern, or query on a tool line. Paths are never clipped. |
 | `traceFile` | *unset* | Diagnostics: append one line per decision (attach, startup outcome, turn boundary, write result) to this file. Off when unset. |
+
+## Compaction
+
+The file is not an archive; it is a handover note, and every byte of it is
+injected into the next session's context. So it is bounded on five axes:
+
+- **Three turns.** `maxEntries` keeps the newest three and drops the rest on the
+  next write, including turns an older version left behind.
+- **One entry per turn.** A turn that stops twice refreshes its entry rather
+  than appending a second one, so a long session does not inflate the file.
+- **Character caps.** The question, the closing text, and each tool line are
+  truncated rather than stored whole; a paragraph break inside a recorded block
+  becomes a `·` line instead of a blank one.
+- **Repeats collapse.** The tenth `read` of the same file is one line with a
+  `×10` count, and the list is summarised past `maxToolLines`.
+- **A byte ceiling.** `maxFileBytes` drops the oldest entry until the file fits,
+  even when that means fewer than `maxEntries` turns.
+
+In practice a turn costs roughly 150–250 bytes, so the whole file stays near
+1 KB and a fresh session pays about that much context to learn where the last
+three turns left off.
 
 ## How it is built
 
@@ -136,12 +159,12 @@ Every value in the patch row's `config` is optional.
 <!-- current-progress: {"version":1,"createdAt":"2026-10-05T09:59:52.904Z"} -->
 # Current Progress
 
-_Maintained automatically by the DSH `current-progress` plugin. …_
+_Written by the DSH `current-progress` plugin — the last 3 turns, for a session that opens here later. Nothing here is edited by hand._
 
 - **Directory**: `/path/to/dir`
 - **Started**: 2026-10-05 20:59 GMT+11
 - **Last update**: 2026-10-05 21:34 GMT+11
-- **Entries**: 1
+- **Entries**: 3
 
 ## Entries
 
@@ -149,32 +172,37 @@ _Maintained automatically by the DSH `current-progress` plugin. …_
 ### Turn 3 · 2026-10-05 21:34 GMT+11
 
 **Asked**
-
 > fix the header layout
 
 **Tools**
-
 - `edit` — `src/Header.tsx`
+- `bash` — `npm test` ×2
 
 **Result**
-
-> Reflowed the header grid …
+> Reflowed the header grid and reran the suite.
+>
+> ·
+>
+> One caveat: the narrow layout is unchanged.
 <!-- /progress:entry -->
 ```
 
 Entries are delimited by their stable `id` markers, so the file is parsed back
 without any other state, a repeated turn boundary refreshes its entry instead of
-duplicating it, and marker-like text inside recorded content is escaped.
+duplicating it, and marker-like text inside recorded content is escaped. Each
+label sits on its own line: `**Asked** > text` would render the `>` as literal
+text and drop the bold run, because both are inline there.
 
 ## Development
 
 ```sh
 node --check index.js      # syntax
-node selftest.mjs          # offline harness: 41 behaviour checks
+node selftest.mjs          # offline harness: 55 behaviour checks
 node selftest.mjs --dump   # … and print a generated sample file
 ```
 
 `selftest.mjs` drives the plugin against an in-memory Cordis context with fake
 `agents`, `fs`, and `userQuestions` services, covering the ask/decline/headless
 paths, the shape of the question card, the existing-file path, retention,
-deduplication, and escaping.
+compaction of a verbose file left by an older version, deduplication, and
+escaping.

@@ -18,14 +18,17 @@
         injectExisting: true
         # Append one entry per finished turn.
         recordTurns: true
-        # Retention: newest entries win.
-        maxEntries: 100
-        maxFileBytes: 131072
+        # Retention: the newest turns win. Three is deliberate — an existing
+        # file is injected into the next session's context in full, so turns
+        # older than that cost context without changing what it does next.
+        maxEntries: 3
+        maxFileBytes: 16384
         # Context/entry size limits.
-        maxReadBytes: 65536
-        maxAskChars: 1200
-        maxResultChars: 2400
-        maxToolLines: 20
+        maxReadBytes: 12288
+        maxAskChars: 400
+        maxResultChars: 700
+        maxToolLines: 8
+        maxToolDetailChars: 72
         # Diagnostics (off by default): set this to a file path to append one
         # line per decision — attach, startup outcome, provider participation,
         # turn boundary, write result. Useful when a turn produces no entry.

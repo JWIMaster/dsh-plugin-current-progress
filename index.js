@@ -63,7 +63,14 @@ const ENTRY_CLOSE = '<!-- /progress:entry -->';
 const META_PATTERN = /<!--\s*current-progress:\s*(\{[\s\S]*?\})\s*-->/u;
 const ENTRY_PATTERN = /<!-- progress:entry id="([^"]*)" -->\r?\n?([\s\S]*?)<!-- \/progress:entry -->/gu;
 
-/** Defaults; every one of them can be overridden by the patch row's `config`. */
+/**
+ * Defaults; every one of them can be overridden by the patch row's `config`.
+ *
+ * The size limits are deliberately tight. An existing file is injected into the
+ * next session's context in full, and a long transcript of that injection is
+ * pure overhead: three recent turns with the ask, the tools, and the closing
+ * summary carry what a later session actually needs to resume.
+ */
 const DEFAULTS = {
 	fileName: 'CURRENT_PROGRESS.md',
 	ask: true,
@@ -71,12 +78,14 @@ const DEFAULTS = {
 	askAttemptsMs: [0, 300, 900, 2000, 4500, 9000],
 	injectExisting: true,
 	recordTurns: true,
-	maxEntries: 100,
-	maxFileBytes: 131072,
-	maxReadBytes: 65536,
-	maxAskChars: 1200,
-	maxResultChars: 2400,
-	maxToolLines: 20,
+	// Retention: the newest turns win, and the file is trimmed on every write.
+	maxEntries: 3,
+	maxFileBytes: 16384,
+	maxReadBytes: 12288,
+	maxAskChars: 400,
+	maxResultChars: 700,
+	maxToolLines: 8,
+	maxToolDetailChars: 72,
 	// Diagnostics only: when set to a file path, the plugin appends one line per
 	// decision (attach, startup outcome, turn boundary, write result) to it.
 	traceFile: ''
@@ -700,7 +709,7 @@ function renderFile({ fileName, dir, createdAt, entries }) {
 		`<!-- current-progress: ${JSON.stringify({ version: 1, createdAt })} -->`,
 		`# ${titleOf(fileName)}`,
 		'',
-		'_Maintained automatically by the DSH `current-progress` plugin. One entry is appended after every turn so that a session opened later in this directory can see what was already done; nothing here is written by hand._',
+		`_Written by the DSH \`current-progress\` plugin — the last ${entries.length === 0 ? 'few' : entries.length} turn${entries.length === 1 ? '' : 's'}, for a session that opens here later. Nothing here is edited by hand._`,
 		'',
 		`- **Directory**: \`${dir}\``,
 		`- **Started**: ${formatTime(createdAt)}`,
@@ -722,21 +731,26 @@ function renderEntry(entry) {
 	return `${ENTRY_OPEN}"${entry.id}" -->\n${entry.body}\n${ENTRY_CLOSE}`;
 }
 
-/** Render one entry's markdown body. */
+/**
+ * Render one entry's markdown body.
+ *
+ * A section label sits on its own line: `**Asked** > text` would leave the `>`
+ * as literal text and swallow the bold run, because both are inline there. A
+ * blockquote carries the recorded content and keeps the label visually distinct
+ * from it, at the cost of two lines per section.
+ */
 function renderEntryBody(entry, cfg) {
-	const lines = [`### Turn ${entry.turn} · ${formatTime(new Date(entry.time).toISOString())}`, ''];
-	if (entry.ask.length > 0) {
-		lines.push('**Asked**', '');
-		for (const message of entry.ask) lines.push(...quote(message), '');
-	}
-	const tools = renderTools(entry.tools, cfg.maxToolLines);
-	if (tools.length > 0) lines.push('**Tools**', '', ...tools, '');
-	if (entry.result.trim().length > 0) lines.push('**Result**', '', ...quote(entry.result), '');
+	const lines = [`### Turn ${entry.turn} · ${formatTime(new Date(entry.time).toISOString())}`];
+	if (entry.ask.length > 0) lines.push('', '**Asked**', ...quote(flow(entry.ask)));
+	const tools = renderTools(entry.tools, cfg);
+	if (tools.length > 0) lines.push('', '**Tools**', ...tools);
+	if (entry.result.trim().length > 0) lines.push('', '**Result**', ...quote(flow([entry.result])));
 	return lines.join('\n').replace(/\n+$/u, '');
 }
 
 /** Render the tool lines, collapsing repeats and capping the list. */
-function renderTools(tools, maxLines) {
+function renderTools(tools, cfg) {
+	const maxLines = cfg.maxToolLines;
 	const order = [];
 	const counts = new Map();
 	for (const tool of tools ?? []) {
@@ -751,29 +765,63 @@ function renderTools(tools, maxLines) {
 	for (const key of order.slice(0, maxLines)) {
 		const { tool, count } = counts.get(key);
 		const detail = typeof tool.detail === 'string' && tool.detail.length > 0
-			? ` — \`${tool.detail.replace(/`/gu, "'")}\``
+			? ` — \`${clipInline(tool.detail, cfg.maxToolDetailChars).replace(/`/gu, "'")}\``
 			: '';
-		lines.push(`- \`${tool.name.replace(/`/gu, "'")}\`${detail}${count > 1 ? ` (×${count})` : ''}`);
+		lines.push(`- \`${tool.name.replace(/`/gu, "'")}\`${detail}${count > 1 ? ` ×${count}` : ''}`);
 	}
-	if (order.length > maxLines) lines.push(`- … and ${order.length - maxLines} more`);
+	if (order.length > maxLines) lines.push(`- _… ${order.length - maxLines} more_`);
 	return lines;
+}
+
+/**
+ * Join several recorded messages, or the paragraphs of one, into a single flow
+ * of text whose blank lines are marked rather than kept.
+ *
+ * A paragraph break is usually the difference between "Done." and "Done, with
+ * two caveats", so it is worth one character; a blank line costs a line of the
+ * file and a full line-height when the file is rendered.
+ *
+ * @param blocks - text blocks in order.
+ * @returns the joined text, paragraph breaks marked.
+ */
+function flow(blocks) {
+	return (blocks ?? [])
+		.map((block) => String(block).trim())
+		.filter((block) => block.length > 0)
+		.join('\n\n')
+		.split(/\n{2,}/u)
+		.map((paragraph) => paragraph.replace(/\s+/gu, ' ').trim())
+		.filter((paragraph) => paragraph.length > 0)
+		.join('\n\n·\n\n');
 }
 
 /**
  * Prefix every line of a text block so it stays inside the entry, and defuse
  * anything that would look like one of this file's own markers.
- * @param text - arbitrary text recorded from the session.
+ * @param text - arbitrary text recorded from the session, or its lines.
  * @returns the block's lines, already quoted.
  */
 function quote(text) {
-	return String(text)
+	const source = Array.isArray(text) ? text : String(text).split('\n');
+	return source
+		.map((line) => String(line))
+		.join('\n')
 		.replace(/<!--/gu, '&lt;!--')
 		.replace(/-->/gu, '--&gt;')
 		.split('\n')
 		.map((line) => (line.trim().length === 0 ? '>' : `> ${line}`));
 }
 
-/** Read a tool call's most useful argument as a one-line summary. */
+/**
+ * Read a tool call's most useful argument as a one-line summary.
+ *
+ * Paths are kept whole: which file a turn touched is the part worth remembering.
+ * Everything else is clipped to one line, because a recorded command is a label
+ * for the work, not the work.
+ *
+ * @param argumentsText - the call's raw JSON arguments.
+ * @returns a one-line summary, or an empty string when there is nothing useful.
+ */
 function summarizeCall(argumentsText) {
 	let args;
 	try {
@@ -788,7 +836,7 @@ function summarizeCall(argumentsText) {
 	}
 	for (const key of ['command', 'pattern', 'query', 'url', 'description', 'prompt']) {
 		const value = args[key];
-		if (typeof value === 'string' && value.trim().length > 0) return clipInline(firstLine(value), 120);
+		if (typeof value === 'string' && value.trim().length > 0) return clipInline(firstLine(value), DEFAULTS.maxToolDetailChars);
 	}
 	return '';
 }
