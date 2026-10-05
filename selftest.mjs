@@ -19,6 +19,8 @@ function harness({ initial = {}, answer = 'yes', ask = true, askService = true, 
 	const log = [];
 	const listeners = new Map();
 	const contexts = [];
+	/** The question batches the plugin asked, for card-shape assertions. */
+	const asked = [];
 	let askCount = 0;
 
 	const makeCtx = () => {
@@ -30,14 +32,23 @@ function harness({ initial = {}, answer = 'yes', ask = true, askService = true, 
 					return {
 						ask: async (request) => {
 							askCount += 1;
+							asked.push(request.questions[0]);
 							log.push(`ASK: ${request.questions[0].question}`);
+							// Answer the way a recommending client does: it shows the
+							// first option with its "(Recommended)" suffix and returns the
+							// bare label when the user submits it.
+							const options = request.questions[0].options ?? [];
+							const bare = (label) => String(label).replace(/\s*\((?:recommended|推荐)\)\s*$/iu, '');
 							if (answer === 'yes') {
-								return { answers: [{ id: request.questions[0].id, selected: ['Yes, create it'] }] };
+								return { answers: [{ id: request.questions[0].id, selected: [bare(options[0].label)] }] };
+							}
+							if (answer === 'yes-suffixed') {
+								return { answers: [{ id: request.questions[0].id, selected: [options[0].label] }] };
 							}
 							if (answer === 'custom') {
 								return { answers: [{ id: request.questions[0].id, selected: [], custom: 'yes please' }] };
 							}
-							return { answers: [{ id: request.questions[0].id, selected: ['No, continue without it'] }] };
+							return { answers: [{ id: request.questions[0].id, selected: [options.at(-1).label] }] };
 						}
 					};
 				}
@@ -141,6 +152,7 @@ function harness({ initial = {}, answer = 'yes', ask = true, askService = true, 
 		emit,
 		feed,
 		emitGlobal,
+		asked,
 		get askCount() { return askCount; },
 		listeners
 	};
@@ -177,7 +189,32 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 	check('one entry per turn', (again.match(/progress:entry id=/gu) ?? []).length === 1);
 }
 
-// 2. The file already exists: read it, never ask.
+// 2. The create question is shaped for the question card, not for a yes/no prompt.
+{
+	const h = harness({ answer: 'yes', initial: {} });
+	await tick();
+	const q = h.asked[0];
+	check('card: asks the question once', h.asked.length === 1, `asks=${h.asked.length}`);
+	check('card: verb-first question, no stray path', q?.question === 'Record progress in this directory?', q?.question);
+	check('card: short eyebrow header', q?.header === 'Current progress', q?.header);
+	check('card: detail explains the file and who maintains it', /CURRENT_PROGRESS\.md/u.test(q?.detail ?? '') && /never edit it by hand/u.test(q?.detail ?? ''), q?.detail);
+	check('card: detail stays scannable', (q?.detail ?? '').length <= 320, `${(q?.detail ?? '').length} chars`);
+	check('card: two options', q?.options?.length === 2, `${q?.options?.length}`);
+	check('card: first option is marked recommended', /\(Recommended\)$/u.test(q?.options?.[0]?.label ?? ''), q?.options?.[0]?.label);
+	check('card: option labels name their action', q?.options?.[0]?.label?.startsWith('Create') === true && q?.options?.[1]?.label === 'Continue without it', q?.options?.map((o) => o.label).join(' | '));
+	check('card: every option carries a description', q?.options?.every((o) => typeof o.description === 'string' && o.description.length > 0) === true);
+	check('card: decline says the question returns', /next time a session starts here/u.test(q?.options?.[1]?.description ?? ''), q?.options?.[1]?.description);
+	check('card: the recommended option still creates the file', h.files.has('/ws/CURRENT_PROGRESS.md'));
+}
+
+// 3. A client that echoes the suffixed recommended label still counts as yes.
+{
+	const h = harness({ answer: 'yes-suffixed' });
+	await tick();
+	check('recommendation suffix is stripped when matching', h.files.has('/ws/CURRENT_PROGRESS.md'));
+}
+
+// 4. The file already exists: read it, never ask.
 {
 	const existing = '<!-- current-progress: {"version":1,"createdAt":"2026-01-01T00:00:00.000Z"} -->\n# Current Progress\n\n## Entries\n\n<!-- progress:entry id="old:7" -->\n### Turn 7 · earlier\n\n**Result**\n\n> earlier work\n<!-- /progress:entry -->\n';
 	const h = harness({ initial: { '/ws/CURRENT_PROGRESS.md': existing } });

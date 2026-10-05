@@ -44,8 +44,19 @@ const CONTEXT_NAME = 'current-progress:file';
 const CONTEXT_ORDER = 130;
 /** Stable question id, echoed back in the answer batch. */
 const QUESTION_ID = 'current-progress:create';
-const YES_LABEL = 'Yes, create it';
-const NO_LABEL = 'No, continue without it';
+/**
+ * Option labels of the create question.
+ *
+ * A client that marks its recommendation shows the first option as
+ * `RECOMMENDED_SUFFIX`-suffixed and returns the bare label when chosen, so the
+ * label is compared with that suffix stripped. Both labels name their action
+ * instead of answering "yes"/"no", because a client may present the options as
+ * standalone buttons (and a plan-review-capable one reads them out of context).
+ */
+const CREATE_LABEL = 'Create CURRENT_PROGRESS.md';
+const DECLINE_LABEL = 'Continue without it';
+/** Recommendation suffix recognised by the Harness question card. */
+const RECOMMENDED_SUFFIX = /\s*\((?:recommended|推荐)\)\s*$/iu;
 /** Entry markers, so the file can be parsed back without any other state. */
 const ENTRY_OPEN = '<!-- progress:entry id=';
 const ENTRY_CLOSE = '<!-- /progress:entry -->';
@@ -361,11 +372,17 @@ async function askToCreate(ctx, state) {
 	const questions = [{
 		id: QUESTION_ID,
 		header: 'Current progress',
-		question: `Create ${cfg.fileName} in ${state.cwd}?`,
-		detail: `This plugin appends one short entry after every turn of this session — what was asked, which tools ran, and how it ended — so a later session opened in this directory can pick up where this one stopped. Nothing is written unless you agree, and an existing ${cfg.fileName} is read instead of being recreated.`,
+		question: 'Record progress in this directory?',
+		detail: `${cfg.fileName} keeps a short summary of each turn — what was asked, which tools ran, how it ended — so a session opened here later starts with that context instead of a blank slate. This plugin maintains it; you never edit it by hand.`,
 		options: [
-			{ label: YES_LABEL, description: `Create ${cfg.fileName} now and keep it updated after each turn.` },
-			{ label: NO_LABEL, description: `Work without a progress file; the question comes back at the next session start.` }
+			{
+				label: `${CREATE_LABEL} (Recommended)`,
+				description: `Create \`${cfg.fileName}\` and update it after every turn.`
+			},
+			{
+				label: DECLINE_LABEL,
+				description: `Write nothing now. This question returns the next time a session starts here.`
+			}
 		]
 	}];
 
@@ -594,13 +611,23 @@ function isRoot(ctx, agent) {
 	}
 }
 
-/** Read the answer batch and decide whether the user said yes. */
+/**
+ * Read the answer batch and decide whether the user said yes.
+ *
+ * The create option is matched with its recommendation suffix stripped, since a
+ * recommending client displays (and may echo) the suffixed label while the
+ * recorded answer carries the bare one. A typed answer is still honoured, so a
+ * client that renders free text instead of options keeps working.
+ */
 function isYes(answer) {
 	const item = Array.isArray(answer?.answers)
 		? answer.answers.find((entry) => entry?.id === QUESTION_ID)
 		: undefined;
 	if (item === undefined) return false;
-	if (Array.isArray(item.selected) && item.selected.includes(YES_LABEL)) return true;
+	const chosen = Array.isArray(item.selected)
+		? item.selected.map((label) => String(label).replace(RECOMMENDED_SUFFIX, '').trim())
+		: [];
+	if (chosen.includes(CREATE_LABEL)) return true;
 	const custom = typeof item.custom === 'string' ? item.custom.trim() : '';
 	return /^y(es)?\b/iu.test(custom);
 }

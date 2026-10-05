@@ -14,10 +14,14 @@ what was already done.
    asked.
 3. **Missing file.** The plugin asks the user, through the shared `userQuestions`
    waterfall — the same interactive card the `ask_user_question` tool uses —
-   whether it should create the file. Only an explicit yes writes anything. A
-   connected browser registers its answerer shortly after a session becomes
-   visible, so a `NO_PROVIDER` outcome is retried on a short backoff instead of
-   being treated as a refusal.
+   whether it should create the file. The question names the action rather than
+   asking for a bare yes ("Record progress in this directory?", offering *Create
+   CURRENT_PROGRESS.md* and *Continue without it*), and the create option carries
+   the card's recommendation suffix, so a client that understands it pre-selects
+   and badges that choice. Only an explicit yes writes anything. A connected
+   browser registers its answerer shortly after a session becomes visible, so a
+   `NO_PROVIDER` outcome is retried on a short backoff instead of being treated
+   as a refusal.
 4. **End of every turn.** At the `agent/turn-stopping` boundary — exactly where
    the model owes no further output — one entry is appended recording what was
    asked, which tools ran (with the path or command they touched, repeats
@@ -166,10 +170,11 @@ duplicating it, and marker-like text inside recorded content is escaped.
 
 ```sh
 node --check index.js      # syntax
-node selftest.mjs          # offline harness: 23 behaviour checks
+node selftest.mjs          # offline harness: 41 behaviour checks
 node selftest.mjs --dump   # … and print a generated sample file
 ```
 
 `selftest.mjs` drives the plugin against an in-memory Cordis context with fake
 `agents`, `fs`, and `userQuestions` services, covering the ask/decline/headless
-paths, the existing-file path, retention, deduplication, and escaping.
+paths, the shape of the question card, the existing-file path, retention,
+deduplication, and escaping.
