@@ -760,13 +760,16 @@ function renderFile({ fileName, dir, createdAt, entries }) {
 	const last = entries.at(-1);
 	const furthest = typeof last?.turn === 'number' ? last.turn : undefined;
 	// Turn numbers count within one session, so a "through turn N" range only means
-	// something while every retained entry came from the same session; entries
-	// merged from an earlier session carry its own numbering.
+	// something while every retained entry came from the same session — and only
+	// while the numbers ascend. A restart resumes the session with the counter back
+	// at 1, so equal session ids can still hold two unrelated sequences.
 	const sameSession = entries.length > 0 && entries.every((entry) => entry.sessionId === entries[0].sessionId);
+	const ascending = entries.every((entry, index) => index === 0
+		|| (typeof entry.turn === 'number' && typeof entries[index - 1].turn === 'number' && entry.turn > entries[index - 1].turn));
 	const covered = sameSession
 		? `these are the last ${entries.length} turn${entries.length === 1 ? '' : 's'} in this directory`
 		: `these are the most recent ${entries.length} recorded in this directory`;
-	const reach = sameSession && furthest !== undefined ? ` (through turn ${furthest})` : '';
+	const reach = sameSession && ascending && furthest !== undefined ? ` (through turn ${furthest})` : '';
 	const lines = [
 		`<!-- current-progress: ${JSON.stringify({ version: 1, createdAt })} -->`,
 		`# ${titleOf(fileName)}`,

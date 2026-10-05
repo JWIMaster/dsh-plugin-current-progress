@@ -440,6 +440,23 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 	check('a wrapped paragraph collapses to one line', wrapped.includes('> A single paragraph wrapped by the model over three lines.'), wrapped.split('\n').find((l) => l.includes('single paragraph')) ?? '');
 }
 
+// 15. A restart resets the turn counter, so a range that goes backwards is dropped.
+{
+	const hand = '<!-- current-progress: {"version":1,"createdAt":"2026-10-05T10:21:54.439Z"} -->\n# Current Progress\n\n## Entries\n\n<!-- progress:entry id="session-1:6" -->\n### Turn 6 · earlier\n\n**Done**\n> recorded before the restart\n<!-- /progress:entry -->\n';
+	const h = harness({ initial: { '/ws/CURRENT_PROGRESS.md': hand } });
+	await tick();
+	h.feed('turn/start', { turn: 1 });
+	h.feed('user/message', userMessage('pick the work back up'));
+	h.feed('assistant/message', { turn: 1, step: 1, message: { id: 'a', role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text: 'Resumed.' }] } });
+	await h.emit('agent/turn-stopping', { turn: 1 });
+	await tick(5);
+	const text = h.files.get('/ws/CURRENT_PROGRESS.md');
+	check('the earlier entry survives the restart', text.includes('> recorded before the restart'));
+	check('both entries are kept', (text.match(/progress:entry id=/gu) ?? []).length === 2);
+	check('a backwards turn range is not claimed', !text.includes('through turn'), text.split('\n').find((l) => l.includes('Entries')) ?? '');
+	check('the header still counts the entries', text.includes('- **Entries**: 2'), text.split('\n').find((l) => l.includes('Entries')) ?? '');
+}
+
 // Sample output, for eyeballing the generated file.
 if (process.argv.includes('--dump')) {
 	const h = harness();
