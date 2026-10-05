@@ -1,20 +1,49 @@
 {
   "name": "dsh-plugin-current-progress",
   "version": "1.0.0",
-  "private": true,
+  "description": "Keeps a CURRENT_PROGRESS.md file in each session's working directory: asks at session start whether to create it, reads it instead of asking when it already exists, and appends one entry after every turn.",
   "type": "module",
-  "description": "Keeps a CURRENT_PROGRESS.md file in a session's working directory: asks at session start whether to create it, reads it when it already exists, and appends one entry after every turn.",
+  "license": "MIT",
+  "author": "JWI <jwi@j-w-i.org>",
+  "homepage": "https://github.com/JWIMaster/dsh-plugin-current-progress#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JWIMaster/dsh-plugin-current-progress.git"
+  },
+  "bugs": {
+    "url": "https://github.com/JWIMaster/dsh-plugin-current-progress/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek",
+    "deepseek-harness",
+    "cordis",
+    "cordis-plugin",
+    "progress",
+    "session",
+    "context"
+  ],
+  "engines": {
+    "node": ">=20.3.0"
+  },
   "exports": {
     ".": "./index.js",
     "./locale/*.json": "./locale/*.json",
-    "./icon": "./icon.svg"
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
   },
   "files": [
     "index.js",
     "cordis.patch.yml",
     "locale/*.json",
-    "icon.svg"
+    "icon.svg",
+    "README.md",
+    "LICENSE"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

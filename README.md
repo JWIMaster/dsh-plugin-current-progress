@@ -29,13 +29,65 @@ an owned child has no human answerer.
 
 ## Install
 
+From npm, into any profile:
+
 ```sh
-# from a checkout of this repository
-dsh plugin install /path/to/dsh-plugin-current-progress
+dsh plugin --profile web add dsh-plugin-current-progress
 ```
 
-or point the profile's own patch layer at it. The bundle patch
-(`cordis.patch.yml`) inserts the row and carries the default configuration.
+From a local checkout (development):
+
+```sh
+dsh plugin --profile web add /path/to/dsh-plugin-current-progress
+```
+
+Either way the bundle patch (`cordis.patch.yml`) inserts the row and carries the
+default configuration; override any of it from the profile's own patch layer.
+Installing into a running Harness takes effect on reload; a profile that reports
+`restart-required` needs the app restarted to load the new package generation.
+
+## Publishing (maintainers)
+
+The package is publish-ready: `npm pack --dry-run` shows exactly the eight files
+that ship, and the version lives in `package.json`.
+
+### 1. Put it on GitHub
+
+```sh
+# create an empty public repository named dsh-plugin-current-progress at
+# https://github.com/new (no README, no .gitignore — this repo already has both)
+cd ~/.dsh/plugins/current-progress
+git remote add origin https://github.com/JWIMaster/dsh-plugin-current-progress.git
+git push -u origin main
+```
+
+Use the SSH form (`git@github.com:JWIMaster/dsh-plugin-current-progress.git`) or
+a personal access token instead of a password if HTTPS asks for credentials.
+
+### 2. Publish to npm
+
+```sh
+npm login                     # once per machine; opens the browser
+npm publish                   # unscoped name, public by default (publishConfig.access)
+npm view dsh-plugin-current-progress version   # confirm what the registry serves
+```
+
+For a later release, bump with `npm version patch|minor|major` and run
+`npm publish` again — the tag it creates is worth pushing (`git push --tags`).
+
+If you would rather keep it private to a scope, rename the package to
+`@yourscope/dsh-plugin-current-progress`, set
+`"publishConfig": { "access": "public" }` (unchanged), publish with
+`npm publish --access public`, and update the `name` in `cordis.patch.yml` to
+match, because the patch inserts the row by package name.
+
+### 3. Switch an install from a local link to the registry copy
+
+```sh
+cd ~/.dsh/profiles/web
+pnpm remove dsh-plugin-current-progress
+dsh plugin --profile web add dsh-plugin-current-progress
+```
 
 ## Configuration
 
