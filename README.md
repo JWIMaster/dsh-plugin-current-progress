@@ -6,31 +6,34 @@ what was already done.
 
 ## Behaviour
 
-1. **Session start.** When a session starts — and when the plugin is loaded or
-   reloaded while sessions are already live — the session's working directory is
-   checked for the progress file.
-2. **Existing file.** If it exists, it is read and contributed to the session as
-   dynamic model context (a durable runtime-context snapshot). The user is **not**
-   asked.
-3. **Missing file.** The plugin asks the user, through the shared `userQuestions`
-   waterfall — the same interactive card the `ask_user_question` tool uses —
-   whether it should create the file. The question names the action rather than
-   asking for a bare yes ("Record progress in this directory?", offering *Create
-   CURRENT_PROGRESS.md* and *Continue without it*), and the create option carries
-   the card's recommendation suffix, so a client that understands it pre-selects
-   and badges that choice. Only an explicit yes writes anything. A connected
-   browser registers its answerer shortly after a session becomes visible, so a
-   `NO_PROVIDER` outcome is retried on a short backoff instead of being treated
-   as a refusal.
+1. **Session start.** The session's working directory is checked for the
+   progress file. **Nothing is created and no question is asked** — a directory
+   opts in by running a command, so a directory that never does stays untouched.
+2. **Existing file.** If it exists it is read and contributed to the session as
+   dynamic model context, and this session appends to it.
+3. **Commands.** `/progress-new` creates the file when the directory has none and
+   arms the session; `/progress-clear` resets it to an empty file, dropping the
+   turns an earlier session left behind. Either command arms the session.
 4. **End of every turn.** At the `agent/turn-stopping` boundary — exactly where
-   the model owes no further output — one entry is appended recording what was
-   asked, which tools ran (with the path or command they touched, repeats
-   collapsed), and the assistant's closing text. Only the newest three turns are
-   kept; see [Compaction](#compaction) below.
+   the model owes no further output — one entry is appended recording a summary
+   of the turn. Only the newest three turns are kept; see
+   [Compaction](#compaction) below.
 
-Conversation compaction and cleared conversations neither re-ask nor re-read:
+Conversation compaction and cleared conversations neither re-read nor re-ask:
 they continue an existing session rather than starting one. Subagent children are
 ignored, because an owned child has no human answerer.
+
+## Commands
+
+| Command | Does |
+| --- | --- |
+| `/progress-new` | Create `CURRENT_PROGRESS.md` if this directory has none, and record this session's turns into it. Reports that nothing changed when the file already exists, so it never overwrites history. |
+| `/progress-clear` | Reset the file to a freshly created one, dropping every entry. The file keeps its directory and creation stamp; the turns go. |
+
+Both act on the directory of the session that ran them, and both take no
+arguments. Without a `commands` service in the profile the plugin still records
+turns for a file that already exists; it just cannot be asked to make one, and
+says so once in the log.
 
 ## Install
 
@@ -101,9 +104,6 @@ Every value in the patch row's `config` is optional.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `fileName` | `CURRENT_PROGRESS.md` | File name inside the session's working directory (bare name, no separators). |
-| `ask` | `true` | Ask the user when the file does not exist yet. |
-| `askTimeoutMs` | `120000` | How long one question waits for an answer. |
-| `askAttemptsMs` | `[0, 300, 900, 2000, 4500, 9000]` | Retry schedule while no interactive answerer is attached yet. |
 | `injectExisting` | `true` | Contribute an existing file to the new session's context. |
 | `recordTurns` | `true` | Append one entry per finished turn. |
 | `maxEntries` | `3` | Retention: only this many of the newest turns are kept. |
@@ -240,12 +240,13 @@ re-parse — the `turn` used for retention is not stored anywhere else.
 
 ```sh
 node --check index.js      # syntax
-node selftest.mjs          # offline harness: 83 behaviour checks
+node selftest.mjs          # offline harness: 87 behaviour checks
 node selftest.mjs --dump   # … and print a generated sample file
 ```
 
 `selftest.mjs` drives the plugin against an in-memory Cordis context with fake
-`agents`, `fs`, and `userQuestions` services, covering the ask/decline/headless
-paths, the shape of the question card, the existing-file path, retention,
-compaction of a verbose file left by an older version, the handover sections and
-their reading order, failures joined to their calls, deduplication, and escaping.
+`agents`, `fs`, and `commands` services, covering the opt-in path (a session that
+never runs a command writes nothing), both commands, the existing-file path,
+retention, compaction of a verbose file left by an older version, the handover
+sections and their reading order, failures joined to their calls, deduplication,
+and escaping.

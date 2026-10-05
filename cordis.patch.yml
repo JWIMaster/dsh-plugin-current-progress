@@ -6,14 +6,8 @@
       config:
         # Name of the progress file inside each session's working directory.
         fileName: CURRENT_PROGRESS.md
-        # Ask the user at session start when the file does not exist yet.
-        ask: true
-        # How long a single question waits for an answer before giving up.
-        askTimeoutMs: 120000
-        # Retry schedule (ms) while no interactive answerer is attached yet
-        # (a browser client registers its answerer shortly after a session
-        # becomes visible).
-        askAttemptsMs: [0, 300, 900, 2000, 4500, 9000]
+        # Nothing is created automatically: a directory opts in by running
+        # /progress-new, and /progress-clear resets a file that exists.
         # Contribute an existing file to the new session's context.
         injectExisting: true
         # Append one entry per finished turn.

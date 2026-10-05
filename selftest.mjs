@@ -13,42 +13,28 @@ const check = (label, condition, extra = '') => {
 	console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}${extra ? ` — ${extra}` : ''}`);
 };
 
-function harness({ initial = {}, answer = 'yes', ask = true, askService = true, config = {} } = {}) {
+function harness({ initial = {}, commands = true, config = {}, create = false } = {}) {
 	const files = new Map(Object.entries(initial));
+	// `create` stands in for the directory having opted in already: the tests about
+	// recording are not about how the file came to exist.
+	if (create && !files.has('/ws/CURRENT_PROGRESS.md')) files.set('/ws/CURRENT_PROGRESS.md', defaultFile());
 	const versions = new Map();
 	const log = [];
 	const listeners = new Map();
 	const contexts = [];
-	/** The question batches the plugin asked, for card-shape assertions. */
-	const asked = [];
-	let askCount = 0;
+	/** Registered commands, by name, in registration order. */
+	const registered = new Map();
 
 	const makeCtx = () => {
 		const ctx = {
 			logger: { warn: (m) => log.push(m) },
 			get: (key) => {
-				if (key === 'userQuestions') {
-					if (!askService) return undefined;
+				if (key === 'commands') {
+					if (!commands) return undefined;
 					return {
-						ask: async (request) => {
-							askCount += 1;
-							asked.push(request.questions[0]);
-							log.push(`ASK: ${request.questions[0].question}`);
-							// Answer the way a recommending client does: it shows the
-							// first option with its "(Recommended)" suffix and returns the
-							// bare label when the user submits it.
-							const options = request.questions[0].options ?? [];
-							const bare = (label) => String(label).replace(/\s*\((?:recommended|推荐)\)\s*$/iu, '');
-							if (answer === 'yes') {
-								return { answers: [{ id: request.questions[0].id, selected: [bare(options[0].label)] }] };
-							}
-							if (answer === 'yes-suffixed') {
-								return { answers: [{ id: request.questions[0].id, selected: [options[0].label] }] };
-							}
-							if (answer === 'custom') {
-								return { answers: [{ id: request.questions[0].id, selected: [], custom: 'yes please' }] };
-							}
-							return { answers: [{ id: request.questions[0].id, selected: [options.at(-1).label] }] };
+						register: (definition) => {
+							registered.set(definition.name, definition);
+							return () => registered.delete(definition.name);
 						}
 					};
 				}
@@ -141,7 +127,13 @@ function harness({ initial = {}, answer = 'yes', ask = true, askService = true, 
 		for (const listener of listeners.get(event) ?? []) listener(payload);
 	};
 
-	apply(ctx, { fileName: 'CURRENT_PROGRESS.md', askAttemptsMs: [0], askTimeoutMs: 500, ...config, ask });
+	apply(ctx, { fileName: 'CURRENT_PROGRESS.md', ...config });
+	/** Run one registered command as if its name had been typed in the composer. */
+	const run = async (name, rawInput = '') => {
+		const definition = registered.get(name);
+		if (definition === undefined) return { kind: 'error', text: `no command named ${name}` };
+		return definition.handler({ agent, rawInput, signal: new AbortController().signal, commandId: 'c1', attachments: [] });
+	};
 	return {
 		ctx,
 		agent,
@@ -152,22 +144,48 @@ function harness({ initial = {}, answer = 'yes', ask = true, askService = true, 
 		emit,
 		feed,
 		emitGlobal,
-		asked,
-		get askCount() { return askCount; },
+		registered,
+		run,
+		create,
 		listeners
 	};
 }
 
+/** The default file body, for tests that start from an opted-in directory. */
+const defaultFile = () => '<!-- current-progress: {"version":1,"createdAt":"2026-01-01T00:00:00.000Z"} -->\n# Current Progress\n\n_What happened in this directory — the last 0 turns here._\n\n- **Directory**: `/ws`\n- **Entries**: 0\n\n## Entries\n\n_No turn has been recorded yet._\n';
+
 const tick = (ms = 30) => new Promise((resolve) => setTimeout(resolve, ms));
 const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] });
 
-// 1. No file: the plugin asks, and a "yes" creates the file.
+// 1. A directory with no file is left alone: nothing is created, nothing asked.
 {
 	const h = harness();
 	await tick();
-	check('asks when the file is missing', h.askCount === 1, `asks=${h.askCount}`);
-	check('creates the file after yes', h.files.has('/ws/CURRENT_PROGRESS.md'));
-	check('contributes context after creating', h.contexts[0]?.text().length > 0);
+	check('creates nothing on its own', !h.files.has('/ws/CURRENT_PROGRESS.md'), [...h.files.keys()].join(','));
+	check('contributes no context', h.contexts.length === 0 || h.contexts[0].text().length === 0);
+	check('says nothing to the user', h.log.length === 0, h.log.join(' | '));
+	check('registers both commands', h.registered.has('progress-new') && h.registered.has('progress-clear'), [...h.registered.keys()].join(','));
+
+	// Without the command, a turn records nothing.
+	h.feed('turn/start', { turn: 1 });
+	h.feed('user/message', userMessage('build the progress plugin'));
+	h.feed('assistant/message', { turn: 1, step: 1, message: { id: 'a1', role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text: 'Plugin written.' }] } });
+	await h.emit('agent/turn-stopping', { turn: 1 });
+	await tick(5);
+	check('an unarmed session writes no file', !h.files.has('/ws/CURRENT_PROGRESS.md'));
+}
+
+// 2. /progress-new creates the file and arms the session.
+{
+	const h = harness();
+	await tick();
+	const created = await h.run('progress-new');
+	check('the command reports success', created.kind === 'success', created.text);
+	check('it names the file it created', created.text.includes('CURRENT_PROGRESS.md'), created.text);
+	check('the file exists', h.files.has('/ws/CURRENT_PROGRESS.md'));
+	check('it holds the default header', h.files.get('/ws/CURRENT_PROGRESS.md').includes('# Current Progress'));
+	check('it starts with no entries', h.files.get('/ws/CURRENT_PROGRESS.md').includes('_No turn has been recorded yet._'));
+	check('the header is written by this version', h.files.get('/ws/CURRENT_PROGRESS.md').includes('_What happened in this directory'), h.files.get('/ws/CURRENT_PROGRESS.md').split('\n')[3]);
 
 	h.feed('turn/start', { turn: 1 });
 	h.feed('user/message', userMessage('build the progress plugin'));
@@ -187,46 +205,74 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 	await tick(5);
 	const again = h.files.get('/ws/CURRENT_PROGRESS.md');
 	check('one entry per turn', (again.match(/progress:entry id=/gu) ?? []).length === 1);
+
+	// Running it again must not overwrite a file that already has history.
+	const second = await h.run('progress-new');
+	check('a second run changes nothing', second.kind === 'success' && h.files.get('/ws/CURRENT_PROGRESS.md') === again, second.text);
+	check('it says the file already exists', /already exists/u.test(second.text), second.text);
 }
 
-// 2. The create question is shaped for the question card, not for a yes/no prompt.
+// 3. /progress-clear resets the file, dropping what earlier sessions left.
 {
-	const h = harness({ answer: 'yes', initial: {} });
+	const h = harness({ create: true });
 	await tick();
-	const q = h.asked[0];
-	check('card: asks the question once', h.asked.length === 1, `asks=${h.asked.length}`);
-	check('card: verb-first question, no stray path', q?.question === 'Record progress in this directory?', q?.question);
-	check('card: short eyebrow header', q?.header === 'Current progress', q?.header);
-	check('card: detail explains the file and who maintains it', /summary of each turn/u.test(q?.detail ?? '') && /you never edit it by hand/u.test(q?.detail ?? ''), q?.detail);
-	check('card: detail stays scannable', (q?.detail ?? '').length <= 300, `${(q?.detail ?? '').length} chars`);
-	check('card: two options', q?.options?.length === 2, `${q?.options?.length}`);
-	check('card: first option is marked recommended', /\(Recommended\)$/u.test(q?.options?.[0]?.label ?? ''), q?.options?.[0]?.label);
-	check('card: option labels name their action', q?.options?.[0]?.label?.startsWith('Create') === true && q?.options?.[1]?.label === 'Continue without it', q?.options?.map((o) => o.label).join(' | '));
-	check('card: every option carries a description', q?.options?.every((o) => typeof o.description === 'string' && o.description.length > 0) === true);
-	// A description is rendered as a plain string, so markdown syntax in one shows
-	// up as its own characters — the bug this check exists to catch. An underscore
-	// inside a filename is not markup, so only the markers themselves are refused.
-	check('card: no option description implies markup', q?.options?.every((o) => !/[`*[\]]|(^|\s)_|_(\s|$)/u.test(o.description)) === true, q?.options?.map((o) => o.description).join(' | '));
-	check('card: the filename is still named where the choice is made', q?.options?.[0]?.description?.includes('CURRENT_PROGRESS.md') === true, q?.options?.[0]?.description);
-	check('card: decline says the question returns', /next time a session starts here/u.test(q?.options?.[1]?.description ?? ''), q?.options?.[1]?.description);
-	check('card: the recommended option still creates the file', h.files.has('/ws/CURRENT_PROGRESS.md'));
+	await h.run('progress-new');
+	h.feed('turn/start', { turn: 1 });
+	h.feed('user/message', userMessage('first turn'));
+	h.feed('assistant/message', { turn: 1, step: 1, message: { id: 'a1', role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text: 'Did the first thing.' }] } });
+	await h.emit('agent/turn-stopping', { turn: 1 });
+	await tick(5);
+	const before = h.files.get('/ws/CURRENT_PROGRESS.md');
+	check('the turn was recorded before clearing', before.includes('<!-- progress:entry id="session-1:1" -->'));
+	const created = JSON.parse(/<!-- current-progress: (\{[^]*?\}) -->/u.exec(before)[1]).createdAt;
+
+	const cleared = await h.run('progress-clear');
+	check('the clear reports success', cleared.kind === 'success', cleared.text);
+	const after = h.files.get('/ws/CURRENT_PROGRESS.md');
+	check('the entries are gone', !after.includes('progress:entry id='), after.split('\n').filter((l) => l.includes('progress:entry')).join(' | '));
+	check('it is a fresh file again', after.includes('_No turn has been recorded yet._'));
+	check('the cleared file is smaller', after.length < before.length, `${before.length} -> ${after.length}`);
+	check('the file keeps its identity', JSON.parse(/<!-- current-progress: (\{[^]*?\}) -->/u.exec(after)[1]).createdAt === created);
+	check('the entries count resets', after.includes('- **Entries**: 0'), after.split('\n').find((l) => l.includes('Entries')) ?? '');
+
+	// The session keeps recording into the cleared file.
+	h.feed('turn/start', { turn: 2 });
+	h.feed('user/message', userMessage('second turn'));
+	h.feed('assistant/message', { turn: 2, step: 1, message: { id: 'a2', role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text: 'Did the second thing.' }] } });
+	await h.emit('agent/turn-stopping', { turn: 2 });
+	await tick(5);
+	const next = h.files.get('/ws/CURRENT_PROGRESS.md');
+	check('the session records again after a clear', next.includes('Did the second thing.'), next.split('\n').filter((l) => l.startsWith('Summary:')).join(' | '));
+	check('no earlier entry came back', !next.includes('Did the first thing.'));
 }
 
-// 3. A client that echoes the suffixed recommended label still counts as yes.
+// 4. Clearing a directory with no file creates one, and needs no prior state.
 {
-	const h = harness({ answer: 'yes-suffixed' });
+	const h = harness();
 	await tick();
-	check('recommendation suffix is stripped when matching', h.files.has('/ws/CURRENT_PROGRESS.md'));
+	const cleared = await h.run('progress-clear');
+	check('clearing without a file still succeeds', cleared.kind === 'success', cleared.text);
+	check('and leaves a valid default file', h.files.get('/ws/CURRENT_PROGRESS.md')?.includes('_No turn has been recorded yet._') === true);
 }
 
-// 4. The file already exists: read it, never ask.
+// 5. A profile without a command service still records turns.
 {
-	const existing = '<!-- current-progress: {"version":1,"createdAt":"2026-01-01T00:00:00.000Z"} -->\n# Current Progress\n\n## Entries\n\n<!-- progress:entry id="old:7" -->\n### Turn 7 · earlier\n\n**Result**\n\n> earlier work\n<!-- /progress:entry -->\n';
+	const h = harness({ commands: false });
+	await tick();
+	check('a missing command service is logged', h.log.some((line) => line.includes('command service')), h.log.join(' | '));
+	const attempted = await h.run('progress-new');
+	check('the command is simply absent', attempted.kind === 'error', attempted.text);
+}
+
+// 6. The file already exists: it is read into context and appended to.
+{
+	const existing = '<!-- current-progress: {"version":1,"createdAt":"2026-01-01T00:00:00.000Z"} -->\n# Current Progress\n\n## Entries\n\n<!-- progress:entry id="old:7" -->\n### Turn 7 · earlier\n\nSummary: earlier work\n<!-- /progress:entry -->\n';
 	const h = harness({ initial: { '/ws/CURRENT_PROGRESS.md': existing } });
 	await tick();
-	check('does not ask when the file exists', h.askCount === 0, `asks=${h.askCount}`);
+	check('asks nothing when the file exists', h.log.length === 0, h.log.join(' | '));
+	check('arms the session without a command', h.contexts.length > 0 && h.contexts[0].text().length > 0, 'no context');
 	const context = h.contexts[0]?.text() ?? '';
-	check('reads the existing file into context', context.includes('> earlier work') && context.includes('/ws/CURRENT_PROGRESS.md'));
+	check('reads the existing file into context', context.includes('earlier work') && context.includes('/ws/CURRENT_PROGRESS.md'));
 
 	h.feed('turn/start', { turn: 2 });
 	h.feed('user/message', userMessage('continue'));
@@ -238,38 +284,9 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 	check('preserves the original creation stamp', text.includes('"createdAt":"2026-01-01T00:00:00.000Z"'));
 }
 
-// 3. Declining writes nothing, at startup and at turn end.
+// 7. Only genuine user input is recorded.
 {
-	const h = harness({ answer: 'no' });
-	await tick();
-	check('asks on decline path', h.askCount === 1);
-	check('declining creates nothing', !h.files.has('/ws/CURRENT_PROGRESS.md'));
-	h.feed('turn/start', { turn: 1 });
-	h.feed('user/message', userMessage('do work'));
-	h.feed('assistant/message', { turn: 1, step: 1, message: { id: 'a', role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text: 'done' }] } });
-	await h.emit('agent/turn-stopping', { turn: 1 });
-	await tick(5);
-	check('no turn entry after declining', !h.files.has('/ws/CURRENT_PROGRESS.md'));
-}
-
-// 4. A custom typed answer counts as yes.
-{
-	const h = harness({ answer: 'custom' });
-	await tick();
-	check('typed answer creates the file', h.files.has('/ws/CURRENT_PROGRESS.md'));
-}
-
-// 5. No answerer (headless): retries once, then gives up without throwing.
-{
-	const h = harness({ askService: false });
-	await tick();
-	check('survives a profile without user-questions', !h.files.has('/ws/CURRENT_PROGRESS.md'));
-	check('logs the reason', h.log.some((line) => line.includes('user-questions service')), h.log.at(-1) ?? '');
-}
-
-// 6. Only genuine user input is recorded.
-{
-	const h = harness();
+	const h = harness({ create: true });
 	await tick();
 	h.feed('turn/start', { turn: 1 });
 	h.feed('user/message', { id: 'ctx', role: 'user', source: { kind: 'system-prompt' }, content: [{ type: 'text', text: 'runtime context blob' }] });
@@ -281,9 +298,9 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 	check('skips injected context messages', text.includes('Query: real ask') && !text.includes('runtime context blob'));
 }
 
-// 7. Retention keeps the newest entries.
+// 8. Retention keeps the newest entries.
 {
-	const h = harness({ config: { maxEntries: 2, maxFileBytes: 100000 } });
+	const h = harness({ create: true, config: { maxEntries: 2, maxFileBytes: 100000 } });
 	await tick();
 	for (const turn of [1, 2, 3]) {
 		h.feed('turn/start', { turn });
@@ -296,9 +313,9 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 	check('retention keeps only the newest', JSON.stringify(ids) === JSON.stringify(['session-1:2', 'session-1:3']), ids.join(','));
 }
 
-// 8. By default only the last three turns are kept, and the file stays small.
+// 9. By default only the last three turns are kept, and the file stays small.
 {
-	const h = harness();
+	const h = harness({ create: true });
 	await tick();
 	for (const turn of [1, 2, 3, 4, 5]) {
 		h.feed('turn/start', { turn });
@@ -358,7 +375,7 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 
 // 11. A marker-looking result cannot break the file structure.
 {
-	const h = harness();
+	const h = harness({ create: true });
 	await tick();
 	h.feed('turn/start', { turn: 1 });
 	h.feed('assistant/message', { turn: 1, step: 1, message: { id: 'a', role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text: 'oops <!-- /progress:entry -->' }] } });
@@ -371,7 +388,7 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 
 // 12. The entry reads as a handover: what changed, what failed, what was read.
 {
-	const h = harness();
+	const h = harness({ create: true });
 	await tick();
 	h.feed('turn/start', { turn: 1 });
 	h.feed('user/message', userMessage('add the retention cap and pick a test runner'));
@@ -407,7 +424,7 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 
 // 13. The header says which part of the work the file covers.
 {
-	const h = harness();
+	const h = harness({ create: true });
 	await tick();
 	for (const turn of [1, 2, 3, 4, 5]) {
 		h.feed('turn/start', { turn });
@@ -424,7 +441,7 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 
 // 14. A recorded summary keeps the markdown structures that need their line breaks.
 {
-	const h = harness();
+	const h = harness({ create: true });
 	await tick();
 	h.feed('turn/start', { turn: 1 });
 	h.feed('user/message', userMessage('summarise the release state'));
@@ -438,7 +455,7 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 	check('no structure line was merged into another', !/\| [^|]*\| \|/u.test(text));
 
 	// Prose paragraphs still collapse, so the entry stays compact.
-	const h2 = harness();
+	const h2 = harness({ create: true });
 	await tick();
 	h2.feed('turn/start', { turn: 1 });
 	h2.feed('assistant/message', { turn: 1, step: 1, message: { id: 'b', role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text: 'A single paragraph\nwrapped by the model\nover three lines.' }] } });
@@ -467,7 +484,7 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 
 // Sample output, for eyeballing the generated file.
 if (process.argv.includes('--dump')) {
-	const h = harness();
+	const h = harness({ create: true });
 	await tick();
 	h.feed('turn/start', { turn: 1 });
 	h.feed('user/message', userMessage('build the progress plugin and install it'));
@@ -487,7 +504,7 @@ if (process.argv.includes('--dump')) {
 	const existing = '<!-- current-progress: {"version":1,"createdAt":"2026-01-01T00:00:00.000Z"} -->\n# Current Progress\n\n## Entries\n';
 	const h = harness({ initial: { '/ws/CURRENT_PROGRESS.md': existing } });
 	await tick();
-	check('handover: existing file arms without asking', h.askCount === 0 && h.log.length === 0, h.log.join('|'));
+	check('handover: an existing file arms the session silently', h.log.length === 0, h.log.join('|'));
 
 	h.emitGlobal('agent/disposed', { agent: h.agent });
 	h.feed('turn/start', { turn: 9 });
@@ -510,7 +527,7 @@ if (process.argv.includes('--dump')) {
 // 10. A registration that collides (a stale prompt context left in the agent's
 //     scope) must not silently kill the listeners.
 {
-	const h = harness();
+	const h = harness({ create: true });
 	await tick();
 	let collisions = 0;
 	// Occupy the plugin's context name in the same scope, then re-create the

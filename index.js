@@ -4,27 +4,26 @@
  *
  * Behaviour
  * ---------
- * 1. When a session starts — and when this plugin is loaded while sessions are
- *    already live — the session's working directory is checked for the progress
- *    file.
- * 2. If the file already exists it is read and contributed as dynamic model
- *    context, so the new session begins with the progress an earlier session
- *    recorded. The user is NOT asked in that case.
- * 3. If the file does not exist, the plugin asks the user, through the shared
- *    `userQuestions` waterfall (the same interactive card the
- *    `ask_user_question` tool uses), whether it should create it. Only an
- *    explicit yes creates anything.
- * 4. Once the file is armed, one entry is appended after every turn — the
+ * 1. When a session starts, its working directory is checked for the progress
+ *    file. Nothing is created and no question is asked: a directory opts in by
+ *    running the command, so a session that never asks stays untouched.
+ * 2. If the file exists it is read and contributed as dynamic model context, so
+ *    the session begins with what earlier sessions recorded, and this session
+ *    appends to it.
+ * 3. `/progress-new` creates the file when the directory has none and arms the
+ *    session; `/progress-clear` resets it to an empty file, dropping the turns an
+ *    earlier session left behind.
+ * 4. Once armed, one entry is appended after every turn — the
  *    `agent/turn-stopping` boundary, which is exactly the point where the model
- *    owes no further output — recording what was asked, which tools ran, and
- *    how the turn ended.
+ *    owes no further output — recording a summary of the turn, what it left
+ *    behind, what failed, and what the session's task list still has open.
  *
  * Design notes
  * ------------
  * - No dependencies: the Host is reached only through Cordis services
- *   (`agents`, `fs`, `systemPrompt`, optional `userQuestions`, optional
- *   `sandboxPolicy`) and through Node built-ins, so the bundle resolves in a
- *   profile whose `node_modules` does not contain the Harness packages.
+ *   (`agents`, `fs`, `systemPrompt`, optional `commands` and `sandboxPolicy`)
+ *   and through Node built-ins, so the bundle resolves in a profile whose
+ *   `node_modules` does not contain the Harness packages.
  * - The session log stays the source of truth: the turn accumulator is a cheap
  *   in-memory fold over the `session/event` feed (no rescans, O(1) per event)
  *   that is only used to write a text file. Nothing is appended to the session.
@@ -42,21 +41,6 @@ import { join } from 'node:path';
 const CONTEXT_NAME = 'current-progress:file';
 /** Placement of the contributed context inside the runtime context snapshot. */
 const CONTEXT_ORDER = 130;
-/** Stable question id, echoed back in the answer batch. */
-const QUESTION_ID = 'current-progress:create';
-/**
- * Option labels of the create question.
- *
- * A client that marks its recommendation shows the first option as
- * `RECOMMENDED_SUFFIX`-suffixed and returns the bare label when chosen, so the
- * label is compared with that suffix stripped. Both labels name their action
- * instead of answering "yes"/"no", because a client may present the options as
- * standalone buttons (and a plan-review-capable one reads them out of context).
- */
-const CREATE_LABEL = 'Create CURRENT_PROGRESS.md';
-const DECLINE_LABEL = 'Continue without it';
-/** Recommendation suffix recognised by the Harness question card. */
-const RECOMMENDED_SUFFIX = /\s*\((?:recommended|推荐)\)\s*$/iu;
 /** Entry markers, so the file can be parsed back without any other state. */
 const ENTRY_OPEN = '<!-- progress:entry id=';
 const ENTRY_CLOSE = '<!-- /progress:entry -->';
@@ -73,9 +57,6 @@ const ENTRY_PATTERN = /<!-- progress:entry id="([^"]*)" -->\r?\n?([\s\S]*?)<!-- 
  */
 const DEFAULTS = {
 	fileName: 'CURRENT_PROGRESS.md',
-	ask: true,
-	askTimeoutMs: 120000,
-	askAttemptsMs: [0, 300, 900, 2000, 4500, 9000],
 	injectExisting: true,
 	recordTurns: true,
 	// Retention: the newest turns win, and the file is trimmed on every write.
@@ -123,8 +104,8 @@ export function apply(ctx, config = {}) {
 		if (entry === undefined) return;
 		wired.delete(agent);
 		entry.state.closed = true;
-		// Cancels a pending question, a retry sleep, and in-flight file I/O, so a
-		// runtime that is going away can no longer write anything.
+		// Cancels in-flight file I/O, so a runtime that is going away can no
+		// longer write anything.
 		entry.state.controller.abort(new Error('session wiring released'));
 		try {
 			entry.dispose();
@@ -137,6 +118,12 @@ export function apply(ctx, config = {}) {
 		unloading = true;
 		for (const agent of [...wired.keys()]) unwire(agent);
 	}, 'current-progress: per-session registrations');
+
+	// Commands act on the directory of whoever invoked them, so the agent that
+	// arrives with the invocation decides which session state is used.
+	const stateOf = (agent) => wired.get(agent)?.state ?? [...wired.values()].find((entry) => entry.state.sessionId === agent?.id)?.state;
+	const disposeCommands = registerCommands(ctx, stateOf, warn);
+	ctx.effect(() => () => disposeCommands(), 'current-progress: commands');
 
 	ctx.on('agent/disposed', ({ agent }) => unwire(agent));
 	ctx.on('agent/created', ({ agent, source }) => {
@@ -322,7 +309,7 @@ async function startup(ctx, state) {
 	}
 
 	if (info !== undefined) {
-		// The file is already there: read it, never ask.
+		// The file is there: read it, and this session records into it.
 		let text = '';
 		try {
 			text = await ctx.fs.readText(target, signal);
@@ -335,102 +322,126 @@ async function startup(ctx, state) {
 		state.armed = true;
 		state.createdAt = readMeta(text)?.createdAt;
 		if (cfg.injectExisting) state.contextText = existingContext(target, text, cfg);
-		trace(cfg, state.sessionId, `startup: existing file read (${text.length} chars), armed, no question asked`);
+		trace(cfg, state.sessionId, `startup: existing file read (${text.length} chars), armed`);
 		return;
 	}
 
-	trace(cfg, state.sessionId, `startup: file missing, ask=${cfg.ask}`);
-	if (!cfg.ask) {
-		state.contextText = createdContext(target, false);
-		return;
-	}
-
-	const decision = await askToCreate(ctx, state);
-	if (state.closed) return;
-	if (!decision.yes) {
-		warnFor(ctx, `${cfg.fileName} not created (${decision.reason})`);
-		trace(cfg, state.sessionId, `startup: not created (${decision.reason})`);
-		return;
-	}
-
-	try {
-		await appendEntries(ctx, state, []);
-	} catch (error) {
-		warnFor(ctx, `cannot create ${target.displayPath}: ${describe(error)}`);
-		trace(cfg, state.sessionId, `startup: create failed: ${describe(error)}`);
-		return;
-	}
-	state.armed = true;
-	state.contextText = createdContext(target, true);
-	trace(cfg, state.sessionId, `startup: created and armed "${target.displayPath}"`);
+	// Nothing is created, and nothing is asked, without an explicit command: a
+	// directory that has never opted in stays untouched, and a session that wants
+	// the file asks for it with /progress-new.
+	trace(cfg, state.sessionId, `startup: no ${cfg.fileName}; waiting for /progress-new`);
 }
 
 /**
- * Ask the user whether the progress file should be created.
+ * Register the plugin's human commands: `/progress-new` and `/progress-clear`.
  *
- * The question travels the standard `userQuestions` waterfall, which is what a
- * connected client renders as an interactive card in the session's composer.
- * A browser client only registers its answerer once the session is visible, so
- * a `NO_PROVIDER` outcome is retried on a short backoff instead of being
- * treated as a refusal.
+ * Registration happens once for the process rather than per agent, because the
+ * registry is shared and the commands act on the directory of whichever agent
+ * ran them; the agent arrives on each invocation. Without a command service the
+ * plugin still records turns, it just has no way to be asked for a new file.
  *
  * @param ctx - Host plugin context.
- * @param state - session state.
- * @returns whether the user agreed, plus the reason when they did not.
+ * @param stateOf - resolves the live wiring of the agent that ran a command.
+ * @param warn - plugin logger.
+ * @returns a disposer of the registrations, if any were made.
  */
-async function askToCreate(ctx, state) {
-	const { cfg } = state;
-	const userQuestions = ctx.get('userQuestions');
-	if (userQuestions === undefined || typeof userQuestions.ask !== 'function') {
-		return { yes: false, reason: 'no user-questions service in this profile' };
+function registerCommands(ctx, stateOf, warn) {
+	const commands = ctx.get('commands');
+	if (commands === undefined || typeof commands.register !== 'function') {
+		warn('no command service in this profile; /progress-new and /progress-clear are unavailable');
+		return () => {};
 	}
-	// The detail renders as markdown but an option description does not — it is a
-	// plain string — so a code span in a description ships its backticks as
-	// literal characters. Only the detail may carry markup.
-	const questions = [{
-		id: QUESTION_ID,
-		header: 'Current progress',
-		question: 'Record progress in this directory?',
-		detail: 'The plugin keeps a short summary of each turn here — what was asked, which tools ran, how it ended — so a session opened in this directory later starts with that context. It maintains the file itself; you never edit it by hand.',
-		options: [
-			{
-				label: `${CREATE_LABEL} (Recommended)`,
-				description: `Create ${cfg.fileName} and update it after every turn.`
-			},
-			{
-				label: DECLINE_LABEL,
-				description: 'Write nothing now. This question returns the next time a session starts here.'
-			}
-		]
-	}];
-
-	let reason = 'the question was never answered';
-	for (const delay of cfg.askAttemptsMs) {
-		if (delay > 0) {
-			try {
-				await sleep(delay, state.controller.signal);
-			} catch {
-				return { yes: false, reason: 'the session closed while waiting to ask' };
-			}
-		}
-		if (state.closed) return { yes: false, reason: 'the session closed before the question was answered' };
+	const disposers = [];
+	const register = (definition) => {
 		try {
-			const answer = await userQuestions.ask({
-				questions,
-				agent: state.agent,
-				signal: AbortSignal.any([state.controller.signal, AbortSignal.timeout(cfg.askTimeoutMs)])
-			});
-			return { yes: isYes(answer), reason: 'declined' };
+			const off = commands.register(definition);
+			if (typeof off === 'function') disposers.push(off);
 		} catch (error) {
-			if (error?.code === 'NO_PROVIDER') {
-				reason = 'no interactive client answered the question';
-				continue;
-			}
-			reason = describe(error);
-			break;
+			warn(`could not register /${definition.name}: ${describe(error)}`);
 		}
+	};
+
+	register({
+		name: 'progress-new',
+		description: `Create ${DEFAULTS.fileName} for this directory if it is missing`,
+		handler: (invocation) => runCommand(ctx, invocation, stateOf, (state) => createFile(ctx, state))
+	});
+	register({
+		name: 'progress-clear',
+		description: `Reset ${DEFAULTS.fileName} to an empty file`,
+		handler: (invocation) => runCommand(ctx, invocation, stateOf, (state) => clearFile(ctx, state))
+	});
+	return () => {
+		for (const off of disposers.splice(0)) {
+			try {
+				off();
+			} catch (error) {
+				warn(`could not remove a command registration: ${describe(error)}`);
+			}
+		}
+	};
+}
+
+/**
+ * Resolve the state a command acts on and turn the operation into a result.
+ *
+ * A command is not a turn, so a failure is reported to the person who typed it
+ * rather than written to the log: an error outcome is the only place a command
+ * can explain itself.
+ *
+ * @param ctx - Host plugin context.
+ * @param invocation - the command invocation.
+ * @param stateOf - resolves the live wiring of an agent.
+ * @param run - the operation, which returns the text to show.
+ * @returns the command outcome.
+ */
+async function runCommand(ctx, invocation, stateOf, run) {
+	const state = stateOf(invocation.agent);
+	if (state === undefined) {
+		return { kind: 'error', text: 'This session is not tracking progress in this directory.' };
 	}
-	return { yes: false, reason };
+	try {
+		return { kind: 'success', text: await run(state) };
+	} catch (error) {
+		return { kind: 'error', text: `Could not update ${state.cfg.fileName}: ${describe(error)}` };
+	}
+}
+
+/**
+ * Create the progress file, or report that the directory already has one.
+ * @param ctx - Host plugin context.
+ * @param state - the invoking session's state.
+ * @returns the message to show.
+ */
+async function createFile(ctx, state) {
+	const target = await resolveTarget(ctx, state);
+	const info = await ctx.fs.stat(target, state.controller.signal);
+	if (info !== undefined) return `${state.cfg.fileName} already exists in this directory; nothing changed.`;
+	await appendEntries(ctx, state, []);
+	state.armed = true;
+	state.contextText = createdContext(target, true);
+	trace(state.cfg, state.sessionId, `command: created "${target.displayPath}"`);
+	return `Created ${state.cfg.fileName}. This session records an entry here after every turn.`;
+}
+
+/**
+ * Reset the progress file to an empty one, keeping its identity.
+ *
+ * Pending questions or entries from earlier sessions are dropped: "clear" that
+ * left the old turns in place would not be a clear.
+ *
+ * @param ctx - Host plugin context.
+ * @param state - the invoking session's state.
+ * @returns the message to show.
+ */
+async function clearFile(ctx, state) {
+	const target = await resolveTarget(ctx, state);
+	await appendEntries(ctx, state, [], { reset: true });
+	state.armed = true;
+	state.createdAt = undefined;
+	state.contextText = createdContext(target, true);
+	trace(state.cfg, state.sessionId, `command: cleared "${target.displayPath}"`);
+	return `Cleared ${state.cfg.fileName}. This session records an entry here after every turn.`;
 }
 
 /**
@@ -474,8 +485,10 @@ function recordTurn(ctx, state, payload) {
  * @param ctx - Host plugin context.
  * @param state - session state.
  * @param entries - entries to merge in, in append order.
+ * @param options - `reset` discards the entries already in the file, which is how
+ *   `/progress-clear` returns it to a freshly created file.
  */
-async function appendEntries(ctx, state, entries) {
+async function appendEntries(ctx, state, entries, options = {}) {
 	const { cfg } = state;
 	const signal = state.controller.signal;
 	const target = await resolveTarget(ctx, state);
@@ -483,7 +496,7 @@ async function appendEntries(ctx, state, entries) {
 		const info = await ctx.fs.stat(target, signal);
 		const existing = info === undefined ? undefined : await ctx.fs.readText(target, signal);
 		if (state.closed) return;
-		const parsed = parseFile(existing ?? '');
+		const parsed = options.reset === true ? { createdAt: undefined, entries: [] } : parseFile(existing ?? '');
 		const merged = mergeEntries(parsed.entries, entries, cfg);
 		const kept = trimEntries(merged, cfg);
 		const content = renderFile({
@@ -678,27 +691,6 @@ function isRoot(ctx, agent) {
 	} catch {
 		return false;
 	}
-}
-
-/**
- * Read the answer batch and decide whether the user said yes.
- *
- * The create option is matched with its recommendation suffix stripped, since a
- * recommending client displays (and may echo) the suffixed label while the
- * recorded answer carries the bare one. A typed answer is still honoured, so a
- * client that renders free text instead of options keeps working.
- */
-function isYes(answer) {
-	const item = Array.isArray(answer?.answers)
-		? answer.answers.find((entry) => entry?.id === QUESTION_ID)
-		: undefined;
-	if (item === undefined) return false;
-	const chosen = Array.isArray(item.selected)
-		? item.selected.map((label) => String(label).replace(RECOMMENDED_SUFFIX, '').trim())
-		: [];
-	if (chosen.includes(CREATE_LABEL)) return true;
-	const custom = typeof item.custom === 'string' ? item.custom.trim() : '';
-	return /^y(es)?\b/iu.test(custom);
 }
 
 /** Parse the plugin's metadata comment out of the file. */
@@ -1182,25 +1174,6 @@ function titleOf(fileName) {
 /** UTF-8 byte length of a string. */
 function byteLength(text) {
 	return Buffer.byteLength(text, 'utf8');
-}
-
-/** Sleep that rejects as soon as the given signal aborts. */
-function sleep(ms, signal) {
-	return new Promise((resolve, reject) => {
-		if (signal?.aborted) {
-			reject(new Error('aborted'));
-			return;
-		}
-		const timer = setTimeout(() => {
-			signal?.removeEventListener('abort', onAbort);
-			resolve();
-		}, ms);
-		const onAbort = () => {
-			clearTimeout(timer);
-			reject(new Error('aborted'));
-		};
-		signal?.addEventListener('abort', onAbort, { once: true });
-	});
 }
 
 /** Render an unknown error for a log line. */
