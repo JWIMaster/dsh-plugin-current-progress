@@ -910,24 +910,59 @@ function commandAction(args) {
 
 /**
  * Join several recorded messages, or the paragraphs of one, into a single flow
- * of text whose blank lines are marked rather than kept.
+ * of text that costs no blank lines.
  *
  * A paragraph break is usually the difference between "Done." and "Done, with
  * two caveats", so it is worth one character; a blank line costs a line of the
- * file and a full line-height when the file is rendered.
+ * file and a full line-height when the file is rendered. Both blank lines and
+ * line breaks inside a paragraph are collapsed for that reason.
+ *
+ * The exception is a markdown structure whose meaning is its line breaks — a
+ * table row, a fenced code block, a list item, a heading, a quote. Collapsing
+ * those does not shorten the entry, it destroys it: a four-row table would
+ * otherwise arrive as one row containing every other row. So those lines keep
+ * their breaks, and their blank lines are not eaten either.
  *
  * @param blocks - text blocks in order.
  * @returns the joined text, paragraph breaks marked.
  */
 function flow(blocks) {
-	return (blocks ?? [])
+	const paragraphs = (blocks ?? [])
 		.map((block) => String(block).trim())
 		.filter((block) => block.length > 0)
 		.join('\n\n')
 		.split(/\n{2,}/u)
-		.map((paragraph) => paragraph.replace(/\s+/gu, ' ').trim())
-		.filter((paragraph) => paragraph.length > 0)
-		.join('\n\n·\n\n');
+		.map((paragraph) => paragraph.trim())
+		.filter((paragraph) => paragraph.length > 0);
+	const parts = paragraphs.map((paragraph) => {
+		const lines = paragraph.split('\n');
+		if (!lines.some(isBlockLine)) return paragraph.replace(/\s+/gu, ' ').trim();
+		// Keep the structure's own lines; only runs of blank lines collapse.
+		return lines.map((line) => line.trimEnd()).join('\n').replace(/\n{2,}/gu, '\n').trim();
+	});
+	const joined = [];
+	for (const part of parts) {
+		// Two hard-broken parts already end and start their own lines; a marked
+		// break between them would be a blank line in the middle of a table.
+		if (joined.length > 0) joined.push(/\n$/u.test(joined.at(-1)) || isBlockLine(part.split('\n')[0]) ? '' : '·');
+		joined.push(part);
+	}
+	return joined.join('\n');
+}
+
+/**
+ * Whether one line is part of a markdown structure that depends on its own
+ * line breaks.
+ * @param line - a line of recorded text.
+ * @returns true when collapsing this line into its neighbour would change meaning.
+ */
+function isBlockLine(line) {
+	const text = String(line).trim();
+	return text.startsWith('|') || text.endsWith('|')
+		|| text.startsWith('```') || text.startsWith('~~~')
+		|| /^([-*+]|\d+[.)])\s/u.test(text)
+		|| /^#{1,6}\s/u.test(text)
+		|| text.startsWith('>');
 }
 
 /**

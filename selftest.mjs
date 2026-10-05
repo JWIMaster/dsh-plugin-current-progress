@@ -414,6 +414,32 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 	check('the header says how far the work got', text.includes('- **Entries**: 3 (through turn 5)'), text.split('\n').find((l) => l.includes('Entries')) ?? '');
 }
 
+// 14. A recorded summary keeps the markdown structures that need their line breaks.
+{
+	const h = harness();
+	await tick();
+	h.feed('turn/start', { turn: 1 });
+	h.feed('user/message', userMessage('summarise the release state'));
+	h.feed('assistant/message', { turn: 1, step: 1, message: { id: 'a', role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text: '| Check | Result |\n| --- | --- |\n| tests | 70 pass |\n| publish | blocked |\n\nNext:\n1. run npm publish\n2. restart dsh web\n\nThe suite passed.' }] } });
+	await h.emit('agent/turn-stopping', { turn: 1 });
+	await tick(5);
+	const text = h.files.get('/ws/CURRENT_PROGRESS.md');
+	check('a table keeps one row per line', text.includes('> | tests | 70 pass |\n> | publish | blocked |'), text.split('\n').find((l) => l.includes('tests')) ?? '');
+	check('a numbered list keeps its items apart', text.includes('> 1. run npm publish\n> 2. restart dsh web'));
+	check('prose after a structure still renders', text.includes('> The suite passed.'));
+	check('no structure line was merged into another', !/\| [^|]*\| \|/u.test(text));
+
+	// Prose paragraphs still collapse, so the entry stays compact.
+	const h2 = harness();
+	await tick();
+	h2.feed('turn/start', { turn: 1 });
+	h2.feed('assistant/message', { turn: 1, step: 1, message: { id: 'b', role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text: 'A single paragraph\nwrapped by the model\nover three lines.' }] } });
+	await h2.emit('agent/turn-stopping', { turn: 1 });
+	await tick(5);
+	const wrapped = h2.files.get('/ws/CURRENT_PROGRESS.md');
+	check('a wrapped paragraph collapses to one line', wrapped.includes('> A single paragraph wrapped by the model over three lines.'), wrapped.split('\n').find((l) => l.includes('single paragraph')) ?? '');
+}
+
 // Sample output, for eyeballing the generated file.
 if (process.argv.includes('--dump')) {
 	const h = harness();

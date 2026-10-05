@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-current-progress",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Keeps a CURRENT_PROGRESS.md file in each session's working directory: asks at session start whether to create it, reads it instead of asking when it already exists, and appends one entry after every turn.",
   "type": "module",
   "license": "MIT",
