@@ -111,33 +111,45 @@ Every value in the patch row's `config` is optional.
 | `maxReadBytes` | `12288` | How much of an existing file to read into context. |
 | `maxAskChars` | `400` | Per-message truncation for recorded user input. |
 | `maxResultChars` | `700` | Per-message truncation for the closing summary — the part that tells a later session where the work stopped. |
-| `maxChanges` | `8` | Work lines in an entry's **Changed** section before the list is summarised. |
-| `maxFailures` | `4` | Failed calls listed in an entry's **Failed** section. |
-| `maxScanned` | `5` | Read-only lines in an entry's **Also** section. |
-| `maxToolDetailChars` | `72` | Truncation for a command, pattern, or query in a work line. Paths are never clipped. |
+| `maxFiles` | `6` | Files named in an entry's `Done:` line before the rest are counted. |
+| `maxActions` | `3` | Commands named in an entry's `Done:` line. |
+| `maxFailures` | `4` | Failed calls listed in an entry's `Failed:` section. |
+| `maxTodos` | `6` | Open tasks listed in an entry's `To go:` section. |
+| `maxToolDetailChars` | `72` | Truncation for a pattern or query in a recorded summary. Paths are never clipped. |
 | `maxFailureChars` | `72` | Truncation for a failure reason. |
 | `traceFile` | *unset* | Diagnostics: append one line per decision (attach, startup outcome, turn boundary, write result) to this file. Off when unset. |
 
 ## What an entry says
 
 An entry is written for the next session, which has to pick the work up without
-re-reading the whole transcript. It answers, in this order, what was asked, what
-was done, what changed, what broke, and where the work stopped:
+re-reading the whole transcript. It answers four questions and nothing else:
 
 | Section | Carries |
 | --- | --- |
 | Heading | `### Turn 4 · 2026-10-05 21:34 GMT+11` — when, and which turn of the session. |
-| **Asked** | The human's request, truncated. |
-| **Done** | The assistant's closing summary — the handover itself: what was completed, what is unfinished, what a next step would be. |
-| **Changed** | The calls whose effect outlives the session, as actions: `- **Edited** \`index.js\` ×2`, `- **Ran** npm test — run the offline suite`. |
-| **Failed** | Calls that errored, with the tool's own reason: `- **Ran** npm publish — _one-time password required_`. This is the part a later session most needs, and the part a plain list of tool names hides. |
-| **Also** | Reads and searches, collapsed to one line per distinct call, so the section stays short without pretending they did not happen. |
+| `Query:` | What the human asked for, as one line. |
+| `Summary:` | The assistant's closing prose — what happened and where it stopped. |
+| `Done:` | What the turn left behind: the files it changed, then `ran npm test` for the commands that build, check, or ship something. |
+| `Failed:` | Each call that errored with its reason: ``- `bash` npm publish — one-time password required``. The most valuable line for whoever continues the work. |
+| `To go:` | Whatever the session's own task list still has open, from the latest `todo/write` snapshot. Absent when nothing is open. |
 
-A tool is classified by name (`read`, `edit`, `write`, `bash`, `grep`, …) so a
-known tool reads as *Edited* or *Ran* rather than as an opaque name, and an
-unrecognised one still records as *Used* instead of vanishing. A failure is
-joined to its call through the `tool/result` event's `callId`, which is the only
-place the session log records that a tool did not work.
+There is deliberately no tool inventory. The order calls ran in, and the calls
+that only read or searched something, are activity rather than state: a session
+resuming the work cannot act on "read `index.js` twelve times", but it can act on
+"`index.js` changed". Read-only calls are therefore dropped entirely, an ordinary
+command is dropped in favour of the notable one beside it, and a failure is kept
+because it is the reason the work is unfinished.
+
+Two details make the sections trustworthy:
+
+- **Failures come from the log, not from prose.** A call is joined to its
+  `tool/result` by `callId` — the only place the session records that a tool did
+  not work — and the reason shown is the tool's own message (`cannot modify
+  selftest.mjs: file has not been read — read the file, then retry`) rather than
+  its error identity (`FsError`), which names the problem without helping.
+- **`To go:` is never invented from prose.** It is read from the task list the
+  agent maintains, which is a whole-list snapshot: completed items are simply
+  absent, so nothing has to be guessed and nothing checked off reappears.
 
 ## Compaction
 
@@ -148,8 +160,8 @@ full, so it is bounded on five axes:
   next write, including turns an older version left behind.
 - **One entry per turn.** A turn that stops twice refreshes its entry rather
   than appending a second one, so a long session does not inflate the file.
-- **A handover, not a transcript.** The reads and searches of a long turn collapse
-  to a few lines; the changes and failures keep theirs.
+- **A handover, not a transcript.** Reads and searches are not recorded at all,
+  so a turn that inspected twenty files costs the same as one that inspected two.
 - **Repeats collapse.** The tenth `read` of the same file is one line with a
   `×10` count.
 - **A byte ceiling.** `maxFileBytes` drops the oldest entry until the file fits,
@@ -235,7 +247,7 @@ re-parse — the `turn` used for retention is not stored anywhere else.
 
 ```sh
 node --check index.js      # syntax
-node selftest.mjs          # offline harness: 70 behaviour checks
+node selftest.mjs          # offline harness: 83 behaviour checks
 node selftest.mjs --dump   # … and print a generated sample file
 ```
 

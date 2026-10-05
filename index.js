@@ -84,9 +84,10 @@ const DEFAULTS = {
 	maxReadBytes: 12288,
 	maxAskChars: 400,
 	maxResultChars: 700,
-	maxChanges: 8,
+	maxFiles: 6,
+	maxActions: 3,
 	maxFailures: 4,
-	maxScanned: 5,
+	maxTodos: 6,
 	maxToolDetailChars: 72,
 	maxFailureChars: 72,
 	// Diagnostics only: when set to a file path, the plugin appends one line per
@@ -198,6 +199,8 @@ export function apply(ctx, config = {}) {
 			contextText: '',
 			/** Last context text reported to the trace, so the trace shows participation. */
 			tracedContext: undefined,
+			/** Latest `todo/write` snapshot, which survives across turns. */
+			todos: null,
 			/** Fold of the turn currently being driven. */
 			current: null,
 			lastTurn: 0
@@ -452,6 +455,7 @@ function recordTurn(ctx, state, payload) {
 		ask: current.ask,
 		tools: current.tools,
 		errors: current.errors,
+		todos: state.todos,
 		result: current.result
 	};
 	if (entry.ask.length === 0 && entry.tools.length === 0 && entry.result.trim().length === 0) return undefined;
@@ -557,11 +561,18 @@ function fold(state, event) {
 			break;
 		}
 		case 'tool/call': {
-			turn(state).tools.push({
+			const accumulator = turn(state);
+			accumulator.tools.push({
 				name: typeof data?.name === 'string' && data.name.length > 0 ? data.name : 'tool',
 				detail: summarizeCall(data?.arguments, data?.name),
 				callId: typeof data?.callId === 'string' ? data.callId : undefined
 			});
+			break;
+		}
+		case 'todo/write': {
+			// The session's own task list is the honest answer to "what is left",
+			// so the latest whole-list snapshot is kept for the next entry.
+			if (Array.isArray(data?.todos)) state.todos = data.todos;
 			break;
 		}
 		case 'tool/result': {
@@ -588,9 +599,25 @@ function fold(state, event) {
  */
 function failureReason(data, cfg) {
 	const reason = data?.error?.reason;
-	if (typeof reason === 'string' && reason.trim().length > 0) return clipInline(flow([reason]), cfg.maxFailureChars);
-	const text = textOf(data?.message);
-	return text.length === 0 ? '' : clipInline(flow([text]), cfg.maxFailureChars);
+	if (typeof reason === 'string' && reason.trim().length > 0) return tidyFailure(reason, cfg);
+	return tidyFailure(textOf(data?.message), cfg);
+}
+
+/**
+ * Turn a recorded failure into the sentence a reader needs.
+ *
+ * The message is preferred over the error code: "cannot modify selftest.mjs: file
+ * has not been read — read the file, then retry" already says what went wrong and
+ * how to fix it, while the identity accompanying it is only "FsError". The
+ * message's own `Error:` prefix is dropped because the line is already a failure.
+ *
+ * @param text - the failure's user-facing text, or a declared reason.
+ * @param cfg - resolved plugin configuration.
+ * @returns one short line describing the failure.
+ */
+function tidyFailure(text, cfg) {
+	const one = inline(text).replace(/^Error:\s*/u, '');
+	return one.length === 0 ? '' : clipInline(one, cfg.maxFailureChars);
 }
 
 /**
@@ -770,14 +797,14 @@ function renderFile({ fileName, dir, createdAt, entries }) {
 	const ascending = entries.every((entry, index) => index === 0
 		|| (typeof entry.turn === 'number' && typeof entries[index - 1].turn === 'number' && entry.turn > entries[index - 1].turn));
 	const covered = sameSession
-		? `these are the last ${entries.length} turn${entries.length === 1 ? '' : 's'} in this directory`
-		: `these are the most recent ${entries.length} recorded in this directory`;
+		? `the last ${entries.length} turn${entries.length === 1 ? '' : 's'} in this directory`
+		: `the most recent ${entries.length} turns recorded in this directory`;
 	const reach = sameSession && ascending && furthest !== undefined ? ` (through turn ${furthest})` : '';
 	const lines = [
 		`<!-- current-progress: ${JSON.stringify({ version: 1, createdAt })} -->`,
 		`# ${titleOf(fileName)}`,
 		'',
-		`_Handover note maintained by the DSH \`current-progress\` plugin: ${covered}. Read it to see what was done and where it stopped; nothing here is edited by hand._`,
+		`_What happened in this directory: ${covered}. Each entry records the summary, what it left behind, what failed, and what was still open; nothing here is edited by hand._`,
 		'',
 		`- **Directory**: \`${dir}\``,
 		`- **Started**: ${formatTime(createdAt)}`,
@@ -802,106 +829,125 @@ function renderEntry(entry) {
 /**
  * Render one entry's markdown body — a handover note, not a transcript.
  *
- * A session that opens this directory later needs to know what was done, what
- * changed, what broke, and where the work stopped; it does not need the order in
- * which files were read. So the sections are ordered by how much a reader needs
- * them: the closing summary first, then the changes, then anything that failed,
- * then the work that left no trace a summary would miss.
- *
- * A section label sits on its own line: `**Done** > text` would leave the `>`
- * as literal text and swallow the bold run, because both are inline there.
+ * Four things are worth carrying to a session that opens this directory later:
+ * what happened, what it left behind, what failed, and what is still open. The
+ * order of the recorded tool calls, and the calls that only read something, are
+ * not among them, so neither is written.
  */
 function renderEntryBody(entry, cfg) {
 	const errors = entry.errors instanceof Map ? entry.errors : new Map();
-	const changed = [];
+	// Recorded text is defused before anything else looks at it: a summary that
+	// contains this file's own closing marker would otherwise end its own entry,
+	// and the text after the marker would be dropped when the file is parsed back.
+	const ask = defuse(entry.ask.join(' / '));
+	const result = defuse(entry.result);
+	const done = [];
 	const failed = [];
-	const other = [];
 	for (const tool of entry.tools ?? []) {
 		const failure = tool.callId === undefined ? undefined : errors.get(tool.callId);
-		if (failure !== undefined) failed.push({ tool, failure });
-		else if (MUTATING_TOOLS.has(baseToolName(tool.name))) changed.push(tool);
-		else other.push(tool);
+		if (failure !== undefined) failed.push({ tool, reason: failure });
+		else done.push(tool);
 	}
 	const lines = [`### Turn ${entry.turn} · ${formatTime(new Date(entry.time).toISOString())}`];
-	if (entry.ask.length > 0) lines.push('', '**Asked**', ...quote(flow(entry.ask)));
-	if (entry.result.trim().length > 0) lines.push('', '**Done**', ...quote(flow([entry.result])));
-	const summary = clipGroups(changed, cfg);
-	if (summary.length > 0) lines.push('', '**Changed**', ...summary);
-	if (failed.length > 0) lines.push('', '**Failed**', ...failed.slice(0, cfg.maxFailures).map((item) => `- ${toolLine(item.tool, cfg)} — ${item.failure.length > 0 ? `_${item.failure}_` : '_failed_'}`));
-	if (failed.length > cfg.maxFailures) lines.push(`- _… ${failed.length - cfg.maxFailures} more failed_`);
-	const rests = readOnlySummary(other, cfg);
-	if (rests.length > 0) lines.push('', '**Also**', ...rests);
-	return lines.join('\n').replace(/\n+$/u, '');
+	if (entry.ask.length > 0) lines.push(`Query: ${inline(ask)}`);
+	if (entry.result.trim().length > 0) {
+		// The summary is the prose a later session reads first, so it stays plain
+		// text under one label instead of being quoted: a blockquote turns a short
+		// handover into a shaded block, and its marker cannot share a line with the
+		// label without becoming literal text.
+		lines.push('', ...flow([result]).split('\n').map((line, index) => (index === 0 ? `Summary: ${line}` : line)));
+	}
+	const work = workLine(done, cfg);
+	if (work.length > 0) lines.push('', `Done: ${work}`);
+	if (failed.length > 0) lines.push('', 'Failed:', ...failed.slice(0, cfg.maxFailures).map((item) => `- ${failureLine(item.tool, item.reason)}`));
+	if (failed.length > cfg.maxFailures) lines.push(`- … and ${failed.length - cfg.maxFailures} more`);
+	const open = openTodos(entry.todos, cfg);
+	if (open.length > 0) lines.push('', 'To go:', ...open);
+	return lines.join('\n');
 }
 
-/** Tool names whose effect on the working directory outlives the session. */
-const MUTATING_TOOLS = new Set(['bash', 'pwsh', 'write', 'edit', 'present', 'str-replace-editor', 'fs', 'subagent', 'workflow', 'jobs']);
-
-/** Strip a `dsh-tool-` style prefix so a name matches its call name. */
-function baseToolName(name) {
-	return String(name ?? '').toLowerCase().replace(/^.*\//u, '');
+/** One line of recorded prose, on a single line. */
+function inline(text) {
+	return String(text ?? '').replace(/\s+/gu, ' ').trim();
 }
 
 /**
- * Summarise a turn's mutating calls: one line per call, in order, capped.
- * @param calls - mutating tool calls in call order.
- * @param cfg - resolved plugin configuration.
- * @returns the summary lines.
+ * What a turn left behind, in one line: the files it changed, then the actions
+ * worth knowing about.
+ *
+ * A file entry is the part a later session can act on — open it, diff it, carry
+ * on in it — so paths are kept, and reading is not listed at all. A command is
+ * kept only when it is the kind that changes the deliverable or reports on it.
  */
-function clipGroups(calls, cfg) {
-	const lines = [];
-	const counts = new Map();
-	for (const tool of calls) {
-		const line = toolLine(tool, cfg);
-		if (!counts.has(line)) {
-			counts.set(line, 0);
-			lines.push(line);
+function workLine(tools, cfg) {
+	const files = [];
+	const actions = [];
+	const seen = new Set();
+	for (const tool of tools ?? []) {
+		const name = baseToolName(tool.name);
+		const detail = typeof tool.detail === 'string' ? tool.detail : '';
+		const key = `${name}\u0000${detail}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		if (CHANGING_TOOLS.has(name) && detail.length > 0) files.push(detail.replace(/`/gu, "'"));
+		else if (name === 'bash' || name === 'pwsh' || name === 'bash-persistent' || name === 'pwsh-persistent') {
+			const action = notableAction(tool);
+			if (action !== undefined) actions.push(action);
 		}
-		counts.set(line, counts.get(line) + 1);
 	}
-	const kept = lines.slice(0, cfg.maxChanges).map((line) => `- ${line}${counts.get(line) > 1 ? ` ×${counts.get(line)}` : ''}`);
-	if (lines.length > cfg.maxChanges) kept.push(`- _… ${lines.length - cfg.maxChanges} more_`);
-	return kept;
+	const parts = [];
+	if (files.length > 0) parts.push(files.slice(0, cfg.maxFiles).map((path) => `\`${path}\``).join(', ') + (files.length > cfg.maxFiles ? ` +${files.length - cfg.maxFiles}` : ''));
+	const shown = actions.slice(0, cfg.maxActions);
+	if (actions.length > shown.length) shown.push(`+${actions.length - shown.length} more`);
+	if (shown.length > 0) parts.push(shown.join(' · '));
+	return parts.join(' · ');
 }
 
-/**
- * Summarise the calls that left no change behind.
- *
- * These are the bulk of a long turn and the least worth reading, so they are
- * collapsed to one line per distinct call; failures and scans are the ones a
- * later session would otherwise have to reconstruct from nothing.
- *
- * @param calls - non-mutating tool calls in call order.
- * @param cfg - resolved plugin configuration.
- * @returns the summary lines.
- */
-function readOnlySummary(calls, cfg) {
-	const groups = new Map();
-	for (const tool of calls) {
-		const key = `${baseToolName(tool.name)}\u0000${tool.detail ?? ''}`;
-		const group = groups.get(key) ?? { tool, count: 0 };
-		group.count += 1;
-		groups.set(key, group);
-	}
-	const lines = [...groups.values()].slice(0, cfg.maxScanned).map(({ tool, count }) => `- ${toolLine(tool, cfg)}${count > 1 ? ` ×${count}` : ''}`);
-	if (groups.size > cfg.maxScanned) lines.push(`- _… ${groups.size - cfg.maxScanned} more_`);
-	return lines;
+/** The action a recorded shell command stands for, when it is worth recording. */
+function notableAction(tool) {
+	const detail = typeof tool.detail === 'string' ? tool.detail : '';
+	const action = detail.split(' — ')[0].trim();
+	if (action.length === 0) return undefined;
+	const words = action.split(/\s+/u);
+	const notable = words.some((word) => NOTABLE_ACTIONS.has(word.toLowerCase().replace(/[^a-z-]/gu, '')));
+	return notable ? `ran ${action}` : undefined;
 }
 
-/**
- * One summary line for one tool call, without its list bullet.
- *
- * Callers add the bullet, because a summary line is sometimes composed into a
- * longer line (a failure adds its reason) and a bullet inside that would render
- * as a second, empty item.
- */
-function toolLine(tool, cfg) {
+/** Commands whose outcome a later session needs: they build, check, or ship. */
+const NOTABLE_ACTIONS = new Set(['test', 'tests', 'publish', 'commit', 'push', 'release', 'build', 'lint', 'check', 'typecheck', 'install', 'deploy']);
+
+/** Whether a recorded action describes a file the turn changed. */
+function failureLine(tool, reason) {
 	const name = baseToolName(tool.name);
 	const detail = typeof tool.detail === 'string' ? tool.detail : '';
-	const action = `**${verbOf(name)}**`;
-	if (detail.length === 0) return action;
-	const style = pathDetail(tool.name) ? `\`${detail.replace(/`/gu, "'")}\`` : detail;
-	return `${action} ${style}`;
+	// A command is identified by its action, which is what the reader recognises;
+	// its trailing description is dropped, because the failure reason follows and
+	// two explanations of the same call read as noise.
+	const subject = SHELL_TOOLS.has(name) ? detail.split(' — ')[0].trim() : fileLeaf(detail);
+	const what = subject.length > 0 ? `${subject} ` : '';
+	return `\`${name}\` ${what}— ${reason.length > 0 ? reason : 'failed'}`;
+}
+
+/** The last path segment of a recorded path, so a failure line stays short. */
+function fileLeaf(path) {
+	const text = String(path);
+	const leaf = text.split(/[\\/]/u).filter((part) => part.length > 0).pop() ?? text;
+	return leaf.length > 0 ? leaf : text;
+}
+
+/**
+ * What the session's own task list says is still open.
+ *
+ * This is the one honest source for "what is left to go": the list is a whole
+ * snapshot written by the agent, so closed items are simply absent, and nothing
+ * has to be guessed from prose.
+ */
+function openTodos(todos, cfg) {
+	if (!Array.isArray(todos)) return [];
+	return todos
+		.filter((item) => item?.status !== 'completed' && typeof item?.content === 'string' && item.content.trim().length > 0)
+		.slice(0, cfg.maxTodos)
+		.map((item) => `- ${inline(item.content)}${item.status === 'in_progress' ? ' _(in progress)_' : ''}`);
 }
 
 /** Read a tool's arguments and describe a shell command as an action. */
@@ -977,42 +1023,35 @@ function isBlockLine(line) {
  * @param text - arbitrary text recorded from the session, or its lines.
  * @returns the block's lines, already quoted.
  */
+/**
+ * Defuse anything in recorded text that would look like one of this file's own
+ * markers. Entry bodies are delimited by those markers, so an unescaped one ends
+ * the entry early and loses whatever followed it.
+ *
+ * @param text - arbitrary text recorded from the session.
+ * @returns the same text with marker syntax neutralised.
+ */
+function defuse(text) {
+	return String(text ?? '').replace(/<!--/gu, '&lt;!--').replace(/-->/gu, '--&gt;');
+}
+
+/**
+ * Prefix every line of a text block so it stays inside the entry.
+ * @param text - arbitrary text recorded from the session, or its lines.
+ * @returns the block's lines, already quoted.
+ */
 function quote(text) {
 	const source = Array.isArray(text) ? text : String(text).split('\n');
-	return source
-		.map((line) => String(line))
-		.join('\n')
-		.replace(/<!--/gu, '&lt;!--')
-		.replace(/-->/gu, '--&gt;')
-		.split('\n')
-		.map((line) => (line.trim().length === 0 ? '>' : `> ${line}`));
+	return source.map((line) => (String(line).trim().length === 0 ? '>' : `> ${String(line)}`));
 }
 
-/** The action a tool name stands for, so a summary line reads as a sentence. */
-function verbOf(name) {
-	switch (baseToolName(name)) {
-		case 'write': case 'fs': return 'Wrote';
-		case 'edit': case 'str-replace-editor': return 'Edited';
-		case 'read': return 'Read';
-		case 'bash': case 'pwsh': case 'bash-persistent': case 'pwsh-persistent': return 'Ran';
-		case 'grep': case 'fs-search': return 'Searched';
-		case 'glob': return 'Listed';
-		case 'present': return 'Presented';
-		case 'subagent': case 'subagent-control': return 'Delegated';
-		case 'workflow': return 'Ran workflow';
-		case 'jobs': return 'Job';
-		case 'skill': return 'Loaded skill';
-		case 'todo_write': return 'Planned';
-		case 'ask_user_question': return 'Asked';
-		case 'web_search': case 'web_fetch': case 'read_page': case 'x_search': return 'Looked up';
-		default: return 'Used';
-	}
+/** Strip a `dsh-tool-` style prefix so a name matches its call name. */
+function baseToolName(name) {
+	return String(name ?? '').toLowerCase().replace(/^.*\//u, '');
 }
 
-/** Whether a call's detail is a filesystem path rather than free text. */
-function pathDetail(name) {
-	return /^(write|edit|read|str-replace-editor|fs|present)$/u.test(baseToolName(name));
-}
+/** Tools whose recorded detail is a file the turn changed. */
+const CHANGING_TOOLS = new Set(['write', 'edit', 'str-replace-editor', 'fs']);
 
 /**
  * Read a tool call's most useful argument as a one-line summary.

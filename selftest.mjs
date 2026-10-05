@@ -176,9 +176,9 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 	await h.emit('agent/turn-stopping', { turn: 1 });
 	await tick(5);
 	const text = h.files.get('/ws/CURRENT_PROGRESS.md');
-	check('records the ask', text.includes('> build the progress plugin'));
-	check('records the tool call as an action', text.includes('- **Wrote** `/ws/index.js`'), text.split('\n').find((l) => l.includes('Wrote')) ?? '');
-	check('records the result', text.includes('> Plugin written and installed.'));
+	check('records the query', text.includes('Query: build the progress plugin'));
+	check('records what the turn left behind', text.includes('Done: `/ws/index.js`'), text.split('\n').find((l) => l.startsWith('Done:')) ?? '');
+	check('records the summary', text.includes('Summary: Plugin written and installed.'), text.split('\n').find((l) => l.startsWith('Summary:')) ?? '');
 	check('entry is id-marked', text.includes('<!-- progress:entry id="session-1:1" -->'));
 	check('file parses back', text.includes('<!-- /progress:entry -->'));
 
@@ -278,7 +278,7 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 	await h.emit('agent/turn-stopping', { turn: 1 });
 	await tick(5);
 	const text = h.files.get('/ws/CURRENT_PROGRESS.md');
-	check('skips injected context messages', text.includes('> real ask') && !text.includes('runtime context blob'));
+	check('skips injected context messages', text.includes('Query: real ask') && !text.includes('runtime context blob'));
 }
 
 // 7. Retention keeps the newest entries.
@@ -365,7 +365,7 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 	await h.emit('agent/turn-stopping', { turn: 1 });
 	await tick(5);
 	const text = h.files.get('/ws/CURRENT_PROGRESS.md');
-	check('escapes marker-like text', !text.includes('> oops <!--') && text.includes('&lt;!--'));
+	check('escapes marker-like text', !text.includes('oops <!--') && text.includes('&lt;!--'));
 	check('entry count stays coherent', (text.match(/<!-- \/progress:entry -->/gu) ?? []).length === (text.match(/progress:entry id=/gu) ?? []).length);
 }
 
@@ -383,22 +383,25 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 	h.feed('tool/result', { turn: 1, step: 1, message: { id: 't2', role: 'tool', toolCallId: 'b2', isError: true, source: { kind: 'tool', name: 'bash' }, content: [{ type: 'text', text: 'command not found: vitest' }] }, error: { name: 'BashError', code: 'ENOENT', reason: 'vitest is not installed' } });
 	h.feed('tool/call', { turn: 1, step: 1, callId: 'g1', name: 'grep', arguments: JSON.stringify({ pattern: 'maxEntries' }) });
 	h.feed('assistant/message', { turn: 1, step: 1, message: { id: 'a', role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text: 'Capped retention at three turns and switched the suite to npm test.\n\nVitest is not installed, so the runner switch is unfinished.' }] } });
+	h.feed('todo/write', { todos: [{ content: 'Cap retention at three turns', status: 'completed' }, { content: 'Pick a test runner for CI', status: 'in_progress' }, { content: 'Publish the release', status: 'pending' }] });
 	await h.emit('agent/turn-stopping', { turn: 1 });
 	await tick(5);
 	const text = h.files.get('/ws/CURRENT_PROGRESS.md');
 	const body = text.slice(text.indexOf('### Turn'));
-	const order = ['**Asked**', '**Done**', '**Changed**', '**Failed**', '**Also**'].map((label) => body.indexOf(label));
+	const order = ['Query:', 'Summary:', 'Done:', 'Failed:', 'To go:'].map((label) => body.indexOf(label));
 	check('sections appear in reading order', order.every((at, index) => at !== -1 && (index === 0 || at > order[index - 1])), order.join(','));
-	check('a section label never shares a line with a quote marker', !/^\*\*(Asked|Done)\*\* >/mu.test(text));
-	check('the calling question is recorded', body.includes('> add the retention cap and pick a test runner'));
-	check('the closing summary is the handover', body.includes('> Capped retention at three turns'));
-	check('the summary keeps its second paragraph', body.includes('> Vitest is not installed, so the runner switch is unfinished.'));
-	check('changed work reads as an action', body.includes('- **Edited** `index.js` ×2'), body.split('\n').find((l) => l.includes('Edited')) ?? '');
-	check('a described command uses its description', body.includes('- **Ran** npm test — run the suite'), body.split('\n').find((l) => l.includes('Ran')) ?? '');
-	check('a failure is reported with its reason', body.includes('- **Ran** npx vitest — try vitest — _vitest is not installed_'), body.split('\n').find((l) => l.includes('Failed') || l.includes('vitest')) ?? '');
-	check('the failed call is not also counted as a change', !body.includes('- **Ran** npx vitest — try vitest\n'));
-	check('reads and searches are collapsed into one line', body.includes('- **Read** `index.js`'), body.split('\n').find((l) => l.includes('Read')) ?? '');
-	check('a search appears as an action', body.includes('- **Searched** maxEntries'), body.split('\n').find((l) => l.includes('Searched')) ?? '');
+	check('no label shares its line with a quote marker', !/^(Query|Summary|Done|Failed|To go): >/mu.test(text));
+	check('the calling question is recorded', body.includes('Query: add the retention cap and pick a test runner'));
+	check('the closing summary is the handover', body.includes('Summary: Capped retention at three turns'), body.split('\n').find((l) => l.startsWith('Summary:')) ?? '');
+	check('the summary keeps its second paragraph', body.includes('Vitest is not installed, so the runner switch is unfinished.'));
+	check('changed files are named once', body.includes('Done: `index.js`'), body.split('\n').find((l) => l.startsWith('Done:')) ?? '');
+	check('a notable command is kept as an action', body.includes('ran npm test'), body.split('\n').find((l) => l.startsWith('Done:')) ?? '');
+	check('an ordinary command is not listed as done', !body.split('\n').some((l) => l.startsWith('Done:') && l.includes('vitest')));
+	check('a failure is reported with its reason', body.includes('— vitest is not installed'), body.split('\n').find((l) => l.startsWith('- `')) ?? '');
+	check('the failed call is not also counted as done', !body.includes('Done: `vitest'));
+	check('reads are not listed at all', !/Read:|Also/u.test(body), body.split('\n').find((l) => /Read:|Also/u.test(l)) ?? '');
+	check('what is still open comes from the task list', body.includes('- Pick a test runner for CI _(in progress)_') && body.includes('- Publish the release'), body.split('\n').filter((l) => l.startsWith('- ')).join(' | '));
+	check('a completed task is not reported as open', !body.includes('Cap retention at three turns'));
 	check('a successful tool is not listed as failed', !body.includes('_failed_'));
 }
 
@@ -414,8 +417,8 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 		await tick(2);
 	}
 	const text = h.files.get('/ws/CURRENT_PROGRESS.md');
-	check('the header names the handover note', /_Handover note maintained by the DSH/u.test(text));
-	check('the header counts the retained turns', text.includes('these are the last 3 turns'), text.split('\n').find((l) => l.includes('Handover')) ?? '');
+	check('the header says what the file is', /_What happened in this directory/u.test(text));
+	check('the header counts the retained turns', text.includes('the last 3 turns in this directory'), text.split('\n')[3] ?? '');
 	check('the header says how far the work got', text.includes('- **Entries**: 3 (through turn 5)'), text.split('\n').find((l) => l.includes('Entries')) ?? '');
 }
 
@@ -429,9 +432,9 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 	await h.emit('agent/turn-stopping', { turn: 1 });
 	await tick(5);
 	const text = h.files.get('/ws/CURRENT_PROGRESS.md');
-	check('a table keeps one row per line', text.includes('> | tests | 70 pass |\n> | publish | blocked |'), text.split('\n').find((l) => l.includes('tests')) ?? '');
-	check('a numbered list keeps its items apart', text.includes('> 1. run npm publish\n> 2. restart dsh web'));
-	check('prose after a structure still renders', text.includes('> The suite passed.'));
+	check('a table keeps one row per line', text.includes('| tests | 70 pass |\n| publish | blocked |'), text.split('\n').find((l) => l.includes('tests')) ?? '');
+	check('a numbered list keeps its items apart', text.includes('1. run npm publish\n2. restart dsh web'), text.split('\n').find((l) => l.includes('npm publish')) ?? '');
+	check('prose after a structure still renders', text.includes('The suite passed.'));
 	check('no structure line was merged into another', !/\| [^|]*\| \|/u.test(text));
 
 	// Prose paragraphs still collapse, so the entry stays compact.
@@ -442,7 +445,7 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 	await h2.emit('agent/turn-stopping', { turn: 1 });
 	await tick(5);
 	const wrapped = h2.files.get('/ws/CURRENT_PROGRESS.md');
-	check('a wrapped paragraph collapses to one line', wrapped.includes('> A single paragraph wrapped by the model over three lines.'), wrapped.split('\n').find((l) => l.includes('single paragraph')) ?? '');
+	check('a wrapped paragraph collapses to one line', wrapped.includes('Summary: A single paragraph wrapped by the model over three lines.'), wrapped.split('\n').find((l) => l.includes('single paragraph')) ?? '');
 }
 
 // 15. A restart resets the turn counter, so a range that goes backwards is dropped.

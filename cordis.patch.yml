@@ -29,9 +29,10 @@
         maxReadBytes: 12288
         maxAskChars: 400
         maxResultChars: 700
-        maxChanges: 8
+        maxFiles: 6
+        maxActions: 3
         maxFailures: 4
-        maxScanned: 5
+        maxTodos: 6
         maxToolDetailChars: 72
         maxFailureChars: 72
         # Diagnostics (off by default): set this to a file path to append one
