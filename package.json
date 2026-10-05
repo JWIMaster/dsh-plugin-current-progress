@@ -1,0 +1,23 @@
+{
+  "name": "dsh-plugin-current-progress",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Keeps a CURRENT_PROGRESS.md file in a session's working directory: asks at session start whether to create it, reads it when it already exists, and appends one entry after every turn.",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

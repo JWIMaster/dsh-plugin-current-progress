@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Current Progress File",
+    "description": "Asks at session start whether to keep a CURRENT_PROGRESS.md file in the working directory, reads it instead of asking when it already exists, and appends one entry after every turn."
+  }
+}

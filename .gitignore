@@ -1,0 +1,9 @@
+# Dependencies are installed by the harness profile, never committed here.
+node_modules/
+
+# Local diagnostics produced by the `traceFile` option.
+*.log
+trace.log
+
+# macOS
+.DS_Store
