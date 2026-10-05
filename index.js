@@ -84,8 +84,11 @@ const DEFAULTS = {
 	maxReadBytes: 12288,
 	maxAskChars: 400,
 	maxResultChars: 700,
-	maxToolLines: 8,
+	maxChanges: 8,
+	maxFailures: 4,
+	maxScanned: 5,
 	maxToolDetailChars: 72,
+	maxFailureChars: 72,
 	// Diagnostics only: when set to a file path, the plugin appends one line per
 	// decision (attach, startup outcome, turn boundary, write result) to it.
 	traceFile: ''
@@ -441,9 +444,11 @@ function recordTurn(ctx, state, payload) {
 	const entry = {
 		id: `${state.sessionId}:${turn}`,
 		turn,
+		sessionId: state.sessionId,
 		time: Date.now(),
 		ask: current.ask,
 		tools: current.tools,
+		errors: current.errors,
 		result: current.result
 	};
 	if (entry.ask.length === 0 && entry.tools.length === 0 && entry.result.trim().length === 0) return undefined;
@@ -551,13 +556,38 @@ function fold(state, event) {
 		case 'tool/call': {
 			turn(state).tools.push({
 				name: typeof data?.name === 'string' && data.name.length > 0 ? data.name : 'tool',
-				detail: summarizeCall(data?.arguments)
+				detail: summarizeCall(data?.arguments, data?.name),
+				callId: typeof data?.callId === 'string' ? data.callId : undefined
 			});
+			break;
+		}
+		case 'tool/result': {
+			// Failures are the part of a turn a later session most needs, and they
+			// are invisible in the call list alone: a tool that errored looks exactly
+			// like one that worked until its failure is attached to the call.
+			if (data?.message?.isError !== true) break;
+			const callId = data?.message?.toolCallId;
+			if (typeof callId !== 'string') break;
+			const accumulator = turn(state);
+			accumulator.errors.set(callId, failureReason(data, state.cfg));
 			break;
 		}
 		default:
 			break;
 	}
+}
+
+/**
+ * Describe a failed tool call in one short phrase.
+ * @param data - the `tool/result` event payload.
+ * @param cfg - resolved plugin configuration.
+ * @returns the tool's own reason when it has one, else the start of its output.
+ */
+function failureReason(data, cfg) {
+	const reason = data?.error?.reason;
+	if (typeof reason === 'string' && reason.trim().length > 0) return clipInline(flow([reason]), cfg.maxFailureChars);
+	const text = textOf(data?.message);
+	return text.length === 0 ? '' : clipInline(flow([text]), cfg.maxFailureChars);
 }
 
 /**
@@ -567,7 +597,7 @@ function fold(state, event) {
  */
 function turn(state) {
 	if (state.current === null) {
-		state.current = { turn: state.lastTurn, ask: [], tools: [], result: '' };
+		state.current = { turn: state.lastTurn, ask: [], tools: [], errors: new Map(), result: '' };
 		trace(state.cfg, state.sessionId, `fold: turn accumulator opened (turn ${state.lastTurn})`);
 	}
 	return state.current;
@@ -682,11 +712,15 @@ function parseFile(text) {
  * @returns the merged entries in file order.
  */
 function mergeEntries(entries, additions, cfg) {
-	const merged = [...entries];
+	// An entry read back from the file carries only its id and body, so identity is
+	// restored from the id for every entry that survives — not just the addition.
+	// Retention compares turns across writes, and renderFile needs to know whether
+	// the retained entries really are one session's tail.
+	const merged = entries.map((entry) => ({ ...entry, ...idFacts(entry.id) }));
 	for (const addition of additions) {
 		const body = addition.body ?? renderEntryBody(addition, cfg);
 		const index = merged.findIndex((entry) => entry.id === addition.id);
-		const next = { id: addition.id, body };
+		const next = { id: addition.id, body, ...idFacts(addition.id) };
 		if (index === -1) merged.push(next);
 		else merged[index] = next;
 	}
@@ -702,19 +736,47 @@ function trimEntries(entries, cfg) {
 	return kept;
 }
 
+/**
+ * Read the turn and session back out of an entry id.
+ *
+ * The id (`<session>:<turn>`) is the one piece of an entry that survives a write
+ * and a re-parse, because the file is parsed with nothing but those markers. So
+ * anything derived from an entry's identity is read from here rather than from
+ * fields that exist only on the instance that created the entry.
+ *
+ * @param id - the entry's stable id.
+ * @returns the session id and turn, each only when the id really carries it.
+ */
+function idFacts(id) {
+	const text = String(id ?? '');
+	const split = text.lastIndexOf(':');
+	if (split <= 0 || !/^\d+$/u.test(text.slice(split + 1))) return { sessionId: undefined, turn: undefined };
+	return { sessionId: text.slice(0, split), turn: Number(text.slice(split + 1)) };
+}
+
 /** Render the complete file. */
 function renderFile({ fileName, dir, createdAt, entries }) {
 	const now = new Date().toISOString();
+	const last = entries.at(-1);
+	const furthest = typeof last?.turn === 'number' ? last.turn : undefined;
+	// Turn numbers count within one session, so a "through turn N" range only means
+	// something while every retained entry came from the same session; entries
+	// merged from an earlier session carry its own numbering.
+	const sameSession = entries.length > 0 && entries.every((entry) => entry.sessionId === entries[0].sessionId);
+	const covered = sameSession
+		? `these are the last ${entries.length} turn${entries.length === 1 ? '' : 's'} in this directory`
+		: `these are the most recent ${entries.length} recorded in this directory`;
+	const reach = sameSession && furthest !== undefined ? ` (through turn ${furthest})` : '';
 	const lines = [
 		`<!-- current-progress: ${JSON.stringify({ version: 1, createdAt })} -->`,
 		`# ${titleOf(fileName)}`,
 		'',
-		`_Written by the DSH \`current-progress\` plugin — the last ${entries.length === 0 ? 'few' : entries.length} turn${entries.length === 1 ? '' : 's'}, for a session that opens here later. Nothing here is edited by hand._`,
+		`_Handover note maintained by the DSH \`current-progress\` plugin: ${covered}. Read it to see what was done and where it stopped; nothing here is edited by hand._`,
 		'',
 		`- **Directory**: \`${dir}\``,
 		`- **Started**: ${formatTime(createdAt)}`,
 		`- **Last update**: ${formatTime(now)}`,
-		`- **Entries**: ${entries.length}`,
+		`- **Entries**: ${entries.length}${reach}`,
 		'',
 		'## Entries',
 		''
@@ -732,45 +794,118 @@ function renderEntry(entry) {
 }
 
 /**
- * Render one entry's markdown body.
+ * Render one entry's markdown body — a handover note, not a transcript.
  *
- * A section label sits on its own line: `**Asked** > text` would leave the `>`
- * as literal text and swallow the bold run, because both are inline there. A
- * blockquote carries the recorded content and keeps the label visually distinct
- * from it, at the cost of two lines per section.
+ * A session that opens this directory later needs to know what was done, what
+ * changed, what broke, and where the work stopped; it does not need the order in
+ * which files were read. So the sections are ordered by how much a reader needs
+ * them: the closing summary first, then the changes, then anything that failed,
+ * then the work that left no trace a summary would miss.
+ *
+ * A section label sits on its own line: `**Done** > text` would leave the `>`
+ * as literal text and swallow the bold run, because both are inline there.
  */
 function renderEntryBody(entry, cfg) {
+	const errors = entry.errors instanceof Map ? entry.errors : new Map();
+	const changed = [];
+	const failed = [];
+	const other = [];
+	for (const tool of entry.tools ?? []) {
+		const failure = tool.callId === undefined ? undefined : errors.get(tool.callId);
+		if (failure !== undefined) failed.push({ tool, failure });
+		else if (MUTATING_TOOLS.has(baseToolName(tool.name))) changed.push(tool);
+		else other.push(tool);
+	}
 	const lines = [`### Turn ${entry.turn} · ${formatTime(new Date(entry.time).toISOString())}`];
 	if (entry.ask.length > 0) lines.push('', '**Asked**', ...quote(flow(entry.ask)));
-	const tools = renderTools(entry.tools, cfg);
-	if (tools.length > 0) lines.push('', '**Tools**', ...tools);
-	if (entry.result.trim().length > 0) lines.push('', '**Result**', ...quote(flow([entry.result])));
+	if (entry.result.trim().length > 0) lines.push('', '**Done**', ...quote(flow([entry.result])));
+	const summary = clipGroups(changed, cfg);
+	if (summary.length > 0) lines.push('', '**Changed**', ...summary);
+	if (failed.length > 0) lines.push('', '**Failed**', ...failed.slice(0, cfg.maxFailures).map((item) => `- ${toolLine(item.tool, cfg)} — ${item.failure.length > 0 ? `_${item.failure}_` : '_failed_'}`));
+	if (failed.length > cfg.maxFailures) lines.push(`- _… ${failed.length - cfg.maxFailures} more failed_`);
+	const rests = readOnlySummary(other, cfg);
+	if (rests.length > 0) lines.push('', '**Also**', ...rests);
 	return lines.join('\n').replace(/\n+$/u, '');
 }
 
-/** Render the tool lines, collapsing repeats and capping the list. */
-function renderTools(tools, cfg) {
-	const maxLines = cfg.maxToolLines;
-	const order = [];
-	const counts = new Map();
-	for (const tool of tools ?? []) {
-		const key = `${tool.name}\u0000${tool.detail ?? ''}`;
-		if (!counts.has(key)) {
-			counts.set(key, { tool, count: 0 });
-			order.push(key);
-		}
-		counts.get(key).count += 1;
-	}
+/** Tool names whose effect on the working directory outlives the session. */
+const MUTATING_TOOLS = new Set(['bash', 'pwsh', 'write', 'edit', 'present', 'str-replace-editor', 'fs', 'subagent', 'workflow', 'jobs']);
+
+/** Strip a `dsh-tool-` style prefix so a name matches its call name. */
+function baseToolName(name) {
+	return String(name ?? '').toLowerCase().replace(/^.*\//u, '');
+}
+
+/**
+ * Summarise a turn's mutating calls: one line per call, in order, capped.
+ * @param calls - mutating tool calls in call order.
+ * @param cfg - resolved plugin configuration.
+ * @returns the summary lines.
+ */
+function clipGroups(calls, cfg) {
 	const lines = [];
-	for (const key of order.slice(0, maxLines)) {
-		const { tool, count } = counts.get(key);
-		const detail = typeof tool.detail === 'string' && tool.detail.length > 0
-			? ` — \`${clipInline(tool.detail, cfg.maxToolDetailChars).replace(/`/gu, "'")}\``
-			: '';
-		lines.push(`- \`${tool.name.replace(/`/gu, "'")}\`${detail}${count > 1 ? ` ×${count}` : ''}`);
+	const counts = new Map();
+	for (const tool of calls) {
+		const line = toolLine(tool, cfg);
+		if (!counts.has(line)) {
+			counts.set(line, 0);
+			lines.push(line);
+		}
+		counts.set(line, counts.get(line) + 1);
 	}
-	if (order.length > maxLines) lines.push(`- _… ${order.length - maxLines} more_`);
+	const kept = lines.slice(0, cfg.maxChanges).map((line) => `- ${line}${counts.get(line) > 1 ? ` ×${counts.get(line)}` : ''}`);
+	if (lines.length > cfg.maxChanges) kept.push(`- _… ${lines.length - cfg.maxChanges} more_`);
+	return kept;
+}
+
+/**
+ * Summarise the calls that left no change behind.
+ *
+ * These are the bulk of a long turn and the least worth reading, so they are
+ * collapsed to one line per distinct call; failures and scans are the ones a
+ * later session would otherwise have to reconstruct from nothing.
+ *
+ * @param calls - non-mutating tool calls in call order.
+ * @param cfg - resolved plugin configuration.
+ * @returns the summary lines.
+ */
+function readOnlySummary(calls, cfg) {
+	const groups = new Map();
+	for (const tool of calls) {
+		const key = `${baseToolName(tool.name)}\u0000${tool.detail ?? ''}`;
+		const group = groups.get(key) ?? { tool, count: 0 };
+		group.count += 1;
+		groups.set(key, group);
+	}
+	const lines = [...groups.values()].slice(0, cfg.maxScanned).map(({ tool, count }) => `- ${toolLine(tool, cfg)}${count > 1 ? ` ×${count}` : ''}`);
+	if (groups.size > cfg.maxScanned) lines.push(`- _… ${groups.size - cfg.maxScanned} more_`);
 	return lines;
+}
+
+/**
+ * One summary line for one tool call, without its list bullet.
+ *
+ * Callers add the bullet, because a summary line is sometimes composed into a
+ * longer line (a failure adds its reason) and a bullet inside that would render
+ * as a second, empty item.
+ */
+function toolLine(tool, cfg) {
+	const name = baseToolName(tool.name);
+	const detail = typeof tool.detail === 'string' ? tool.detail : '';
+	const action = `**${verbOf(name)}**`;
+	if (detail.length === 0) return action;
+	const style = pathDetail(tool.name) ? `\`${detail.replace(/`/gu, "'")}\`` : detail;
+	return `${action} ${style}`;
+}
+
+/** Read a tool's arguments and describe a shell command as an action. */
+function commandAction(args) {
+	const command = typeof args?.command === 'string' ? firstLine(args.command) : '';
+	const description = typeof args?.description === 'string' ? firstLine(args.description) : '';
+	const words = command.split(/\s+/u).filter((word) => word.length > 0);
+	const head = words.slice(0, words.length > 1 && /^["']/u.test(words[1]) ? 1 : 2).join(' ');
+	const action = head.length > 0 ? clipInline(head, 64) : 'command';
+	return description.length > 0 ? `${action} — ${clipInline(description, 56)}` : action;
 }
 
 /**
@@ -812,17 +947,45 @@ function quote(text) {
 		.map((line) => (line.trim().length === 0 ? '>' : `> ${line}`));
 }
 
+/** The action a tool name stands for, so a summary line reads as a sentence. */
+function verbOf(name) {
+	switch (baseToolName(name)) {
+		case 'write': case 'fs': return 'Wrote';
+		case 'edit': case 'str-replace-editor': return 'Edited';
+		case 'read': return 'Read';
+		case 'bash': case 'pwsh': case 'bash-persistent': case 'pwsh-persistent': return 'Ran';
+		case 'grep': case 'fs-search': return 'Searched';
+		case 'glob': return 'Listed';
+		case 'present': return 'Presented';
+		case 'subagent': case 'subagent-control': return 'Delegated';
+		case 'workflow': return 'Ran workflow';
+		case 'jobs': return 'Job';
+		case 'skill': return 'Loaded skill';
+		case 'todo_write': return 'Planned';
+		case 'ask_user_question': return 'Asked';
+		case 'web_search': case 'web_fetch': case 'read_page': case 'x_search': return 'Looked up';
+		default: return 'Used';
+	}
+}
+
+/** Whether a call's detail is a filesystem path rather than free text. */
+function pathDetail(name) {
+	return /^(write|edit|read|str-replace-editor|fs|present)$/u.test(baseToolName(name));
+}
+
 /**
  * Read a tool call's most useful argument as a one-line summary.
  *
- * Paths are kept whole: which file a turn touched is the part worth remembering.
- * Everything else is clipped to one line, because a recorded command is a label
- * for the work, not the work.
+ * A summary line should say what the call did, not which knobs it turned, so a
+ * shell command becomes its `description` when it has one and its first couple
+ * of words otherwise, and a file path is kept whole — that is the part a later
+ * session needs to reopen the work.
  *
  * @param argumentsText - the call's raw JSON arguments.
+ * @param name - the tool being called, which decides what "useful" means.
  * @returns a one-line summary, or an empty string when there is nothing useful.
  */
-function summarizeCall(argumentsText) {
+function summarizeCall(argumentsText, name) {
 	let args;
 	try {
 		args = JSON.parse(argumentsText ?? '');
@@ -830,16 +993,20 @@ function summarizeCall(argumentsText) {
 		return '';
 	}
 	if (typeof args !== 'object' || args === null) return '';
+	if (SHELL_TOOLS.has(baseToolName(name))) return commandAction(args);
 	for (const key of ['file_path', 'filePath', 'path', 'target_file', 'notebook_path', 'filename', 'file']) {
 		const value = args[key];
 		if (typeof value === 'string' && value.trim().length > 0) return firstLine(value);
 	}
-	for (const key of ['command', 'pattern', 'query', 'url', 'description', 'prompt']) {
+	for (const key of ['command', 'pattern', 'query', 'url', 'description', 'prompt', 'skill']) {
 		const value = args[key];
 		if (typeof value === 'string' && value.trim().length > 0) return clipInline(firstLine(value), DEFAULTS.maxToolDetailChars);
 	}
 	return '';
 }
+
+/** Tools whose first argument is a shell command rather than a path or query. */
+const SHELL_TOOLS = new Set(['bash', 'pwsh', 'bash-persistent', 'pwsh-persistent']);
 
 /**
  * Shorten text to a character budget on one line, for content that is rendered

@@ -177,7 +177,7 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 	await tick(5);
 	const text = h.files.get('/ws/CURRENT_PROGRESS.md');
 	check('records the ask', text.includes('> build the progress plugin'));
-	check('records the tool call', text.includes('`write` — `/ws/index.js`'), text.split('\n').find((l) => l.includes('write')) ?? '');
+	check('records the tool call as an action', text.includes('- **Wrote** `/ws/index.js`'), text.split('\n').find((l) => l.includes('Wrote')) ?? '');
 	check('records the result', text.includes('> Plugin written and installed.'));
 	check('entry is id-marked', text.includes('<!-- progress:entry id="session-1:1" -->'));
 	check('file parses back', text.includes('<!-- /progress:entry -->'));
@@ -362,6 +362,56 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 	const text = h.files.get('/ws/CURRENT_PROGRESS.md');
 	check('escapes marker-like text', !text.includes('> oops <!--') && text.includes('&lt;!--'));
 	check('entry count stays coherent', (text.match(/<!-- \/progress:entry -->/gu) ?? []).length === (text.match(/progress:entry id=/gu) ?? []).length);
+}
+
+// 12. The entry reads as a handover: what changed, what failed, what was read.
+{
+	const h = harness();
+	await tick();
+	h.feed('turn/start', { turn: 1 });
+	h.feed('user/message', userMessage('add the retention cap and pick a test runner'));
+	h.feed('tool/call', { turn: 1, step: 1, callId: 'r1', name: 'read', arguments: JSON.stringify({ file_path: 'index.js' }) });
+	h.feed('tool/call', { turn: 1, step: 1, callId: 'e1', name: 'edit', arguments: JSON.stringify({ file_path: 'index.js', old_string: 'a', new_string: 'b' }) });
+	h.feed('tool/call', { turn: 1, step: 1, callId: 'e2', name: 'edit', arguments: JSON.stringify({ file_path: 'index.js', old_string: 'c', new_string: 'd' }) });
+	h.feed('tool/call', { turn: 1, step: 1, callId: 'b1', name: 'bash', arguments: JSON.stringify({ command: 'npm test -- --run', description: 'run the suite' }) });
+	h.feed('tool/call', { turn: 1, step: 1, callId: 'b2', name: 'bash', arguments: JSON.stringify({ command: 'npx vitest run --reporter=verbose', description: 'try vitest' }) });
+	h.feed('tool/result', { turn: 1, step: 1, message: { id: 't2', role: 'tool', toolCallId: 'b2', isError: true, source: { kind: 'tool', name: 'bash' }, content: [{ type: 'text', text: 'command not found: vitest' }] }, error: { name: 'BashError', code: 'ENOENT', reason: 'vitest is not installed' } });
+	h.feed('tool/call', { turn: 1, step: 1, callId: 'g1', name: 'grep', arguments: JSON.stringify({ pattern: 'maxEntries' }) });
+	h.feed('assistant/message', { turn: 1, step: 1, message: { id: 'a', role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text: 'Capped retention at three turns and switched the suite to npm test.\n\nVitest is not installed, so the runner switch is unfinished.' }] } });
+	await h.emit('agent/turn-stopping', { turn: 1 });
+	await tick(5);
+	const text = h.files.get('/ws/CURRENT_PROGRESS.md');
+	const body = text.slice(text.indexOf('### Turn'));
+	const order = ['**Asked**', '**Done**', '**Changed**', '**Failed**', '**Also**'].map((label) => body.indexOf(label));
+	check('sections appear in reading order', order.every((at, index) => at !== -1 && (index === 0 || at > order[index - 1])), order.join(','));
+	check('a section label never shares a line with a quote marker', !/^\*\*(Asked|Done)\*\* >/mu.test(text));
+	check('the calling question is recorded', body.includes('> add the retention cap and pick a test runner'));
+	check('the closing summary is the handover', body.includes('> Capped retention at three turns'));
+	check('the summary keeps its second paragraph', body.includes('> Vitest is not installed, so the runner switch is unfinished.'));
+	check('changed work reads as an action', body.includes('- **Edited** `index.js` ×2'), body.split('\n').find((l) => l.includes('Edited')) ?? '');
+	check('a described command uses its description', body.includes('- **Ran** npm test — run the suite'), body.split('\n').find((l) => l.includes('Ran')) ?? '');
+	check('a failure is reported with its reason', body.includes('- **Ran** npx vitest — try vitest — _vitest is not installed_'), body.split('\n').find((l) => l.includes('Failed') || l.includes('vitest')) ?? '');
+	check('the failed call is not also counted as a change', !body.includes('- **Ran** npx vitest — try vitest\n'));
+	check('reads and searches are collapsed into one line', body.includes('- **Read** `index.js`'), body.split('\n').find((l) => l.includes('Read')) ?? '');
+	check('a search appears as an action', body.includes('- **Searched** maxEntries'), body.split('\n').find((l) => l.includes('Searched')) ?? '');
+	check('a successful tool is not listed as failed', !body.includes('_failed_'));
+}
+
+// 13. The header says which part of the work the file covers.
+{
+	const h = harness();
+	await tick();
+	for (const turn of [1, 2, 3, 4, 5]) {
+		h.feed('turn/start', { turn });
+		h.feed('user/message', userMessage(`ask ${turn}`));
+		h.feed('assistant/message', { turn, step: 1, message: { id: `a${turn}`, role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text: `Finished ${turn}.` }] } });
+		await h.emit('agent/turn-stopping', { turn });
+		await tick(2);
+	}
+	const text = h.files.get('/ws/CURRENT_PROGRESS.md');
+	check('the header names the handover note', /_Handover note maintained by the DSH/u.test(text));
+	check('the header counts the retained turns', text.includes('these are the last 3 turns'), text.split('\n').find((l) => l.includes('Handover')) ?? '');
+	check('the header says how far the work got', text.includes('- **Entries**: 3 (through turn 5)'), text.split('\n').find((l) => l.includes('Entries')) ?? '');
 }
 
 // Sample output, for eyeballing the generated file.

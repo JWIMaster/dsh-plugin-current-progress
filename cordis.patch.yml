@@ -23,12 +23,17 @@
         # older than that cost context without changing what it does next.
         maxEntries: 3
         maxFileBytes: 16384
-        # Context/entry size limits.
+        # Context/entry size limits. An entry is a handover note, so the closing
+        # summary gets the most room; the work lines and the failure reasons are
+        # labels, and the reads are collapsed.
         maxReadBytes: 12288
         maxAskChars: 400
         maxResultChars: 700
-        maxToolLines: 8
+        maxChanges: 8
+        maxFailures: 4
+        maxScanned: 5
         maxToolDetailChars: 72
+        maxFailureChars: 72
         # Diagnostics (off by default): set this to a file path to append one
         # line per decision — attach, startup outcome, provider participation,
         # turn boundary, write result. Useful when a turn produces no entry.

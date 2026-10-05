@@ -110,30 +110,53 @@ Every value in the patch row's `config` is optional.
 | `maxFileBytes` | `16384` | Trim oldest entries until the file fits. |
 | `maxReadBytes` | `12288` | How much of an existing file to read into context. |
 | `maxAskChars` | `400` | Per-message truncation for recorded user input. |
-| `maxResultChars` | `700` | Per-message truncation for the recorded closing text. |
-| `maxToolLines` | `8` | Tool lines per entry before the list is summarised. |
-| `maxToolDetailChars` | `72` | Truncation for the command, pattern, or query on a tool line. Paths are never clipped. |
+| `maxResultChars` | `700` | Per-message truncation for the closing summary — the part that tells a later session where the work stopped. |
+| `maxChanges` | `8` | Work lines in an entry's **Changed** section before the list is summarised. |
+| `maxFailures` | `4` | Failed calls listed in an entry's **Failed** section. |
+| `maxScanned` | `5` | Read-only lines in an entry's **Also** section. |
+| `maxToolDetailChars` | `72` | Truncation for a command, pattern, or query in a work line. Paths are never clipped. |
+| `maxFailureChars` | `72` | Truncation for a failure reason. |
 | `traceFile` | *unset* | Diagnostics: append one line per decision (attach, startup outcome, turn boundary, write result) to this file. Off when unset. |
+
+## What an entry says
+
+An entry is written for the next session, which has to pick the work up without
+re-reading the whole transcript. It answers, in this order, what was asked, what
+was done, what changed, what broke, and where the work stopped:
+
+| Section | Carries |
+| --- | --- |
+| Heading | `### Turn 4 · 2026-10-05 21:34 GMT+11` — when, and which turn of the session. |
+| **Asked** | The human's request, truncated. |
+| **Done** | The assistant's closing summary — the handover itself: what was completed, what is unfinished, what a next step would be. |
+| **Changed** | The calls whose effect outlives the session, as actions: `- **Edited** \`index.js\` ×2`, `- **Ran** npm test — run the offline suite`. |
+| **Failed** | Calls that errored, with the tool's own reason: `- **Ran** npm publish — _one-time password required_`. This is the part a later session most needs, and the part a plain list of tool names hides. |
+| **Also** | Reads and searches, collapsed to one line per distinct call, so the section stays short without pretending they did not happen. |
+
+A tool is classified by name (`read`, `edit`, `write`, `bash`, `grep`, …) so a
+known tool reads as *Edited* or *Ran* rather than as an opaque name, and an
+unrecognised one still records as *Used* instead of vanishing. A failure is
+joined to its call through the `tool/result` event's `callId`, which is the only
+place the session log records that a tool did not work.
 
 ## Compaction
 
-The file is not an archive; it is a handover note, and every byte of it is
-injected into the next session's context. So it is bounded on five axes:
+The file is not an archive; it is a handover note that a later session reads in
+full, so it is bounded on five axes:
 
 - **Three turns.** `maxEntries` keeps the newest three and drops the rest on the
   next write, including turns an older version left behind.
 - **One entry per turn.** A turn that stops twice refreshes its entry rather
   than appending a second one, so a long session does not inflate the file.
-- **Character caps.** The question, the closing text, and each tool line are
-  truncated rather than stored whole; a paragraph break inside a recorded block
-  becomes a `·` line instead of a blank one.
+- **A handover, not a transcript.** The reads and searches of a long turn collapse
+  to a few lines; the changes and failures keep theirs.
 - **Repeats collapse.** The tenth `read` of the same file is one line with a
-  `×10` count, and the list is summarised past `maxToolLines`.
+  `×10` count.
 - **A byte ceiling.** `maxFileBytes` drops the oldest entry until the file fits,
   even when that means fewer than `maxEntries` turns.
 
-In practice a turn costs roughly 150–250 bytes, so the whole file stays near
-1 KB and a fresh session pays about that much context to learn where the last
+In practice a turn costs roughly 250–400 bytes, so the whole file stays near
+1.5 KB and a fresh session pays about that much context to learn where the last
 three turns left off.
 
 ## How it is built
@@ -159,50 +182,65 @@ three turns left off.
 <!-- current-progress: {"version":1,"createdAt":"2026-10-05T09:59:52.904Z"} -->
 # Current Progress
 
-_Written by the DSH `current-progress` plugin — the last 3 turns, for a session that opens here later. Nothing here is edited by hand._
+_Handover note maintained by the DSH `current-progress` plugin: these are the last 3 turns in this directory. Read it to see what was done and where it stopped; nothing here is edited by hand._
 
 - **Directory**: `/path/to/dir`
 - **Started**: 2026-10-05 20:59 GMT+11
 - **Last update**: 2026-10-05 21:34 GMT+11
-- **Entries**: 3
+- **Entries**: 3 (through turn 12)
 
 ## Entries
 
-<!-- progress:entry id="<session>:3" -->
-### Turn 3 · 2026-10-05 21:34 GMT+11
+<!-- progress:entry id="<session>:12" -->
+### Turn 12 · 2026-10-05 21:34 GMT+11
 
 **Asked**
-> fix the header layout
+> the card looks bad and the file is huge — fix both, then publish
 
-**Tools**
-- `edit` — `src/Header.tsx`
-- `bash` — `npm test` ×2
-
-**Result**
-> Reflowed the header grid and reran the suite.
+**Done**
+> Reworked the card copy and capped the file at three compact turns.
 >
 > ·
 >
-> One caveat: the narrow layout is unchanged.
+> The publish is unfinished: it needs a one-time password, so the build is
+> pushed but not on the registry.
+
+**Changed**
+- **Edited** `src/Header.tsx` ×2
+- **Ran** npm test — run the offline suite
+
+**Failed**
+- **Ran** npm publish — _one-time password required_
+
+**Also**
+- **Read** `src/Header.tsx`
+- **Searched** maxEntries
 <!-- /progress:entry -->
 ```
+
+Turn numbers count within one session, so `- **Entries**: 3 (through turn 12)`
+appears only while every retained entry came from the same session; after a trim
+that leaves entries from two sessions the header says "the most recent 3
+recorded" instead, because two sessions' turn numbers are not one sequence.
 
 Entries are delimited by their stable `id` markers, so the file is parsed back
 without any other state, a repeated turn boundary refreshes its entry instead of
 duplicating it, and marker-like text inside recorded content is escaped. Each
 label sits on its own line: `**Asked** > text` would render the `>` as literal
-text and drop the bold run, because both are inline there.
+text and drop the bold run, because both are inline there. An entry's identity is
+read back out of its id, because that is the one part of it that survives a
+re-parse — the `turn` used for retention is not stored anywhere else.
 
 ## Development
 
 ```sh
 node --check index.js      # syntax
-node selftest.mjs          # offline harness: 55 behaviour checks
+node selftest.mjs          # offline harness: 70 behaviour checks
 node selftest.mjs --dump   # … and print a generated sample file
 ```
 
 `selftest.mjs` drives the plugin against an in-memory Cordis context with fake
 `agents`, `fs`, and `userQuestions` services, covering the ask/decline/headless
 paths, the shape of the question card, the existing-file path, retention,
-compaction of a verbose file left by an older version, deduplication, and
-escaping.
+compaction of a verbose file left by an older version, the handover sections and
+their reading order, failures joined to their calls, deduplication, and escaping.
