@@ -26,5 +26,7 @@
         maxAskChars: 1200
         maxResultChars: 2400
         maxToolLines: 20
-        # Diagnostics: append one line per decision to this file (unset = off).
-        traceFile: /Users/jwalr/.dsh/plugins/current-progress/trace.log
+        # Diagnostics (off by default): set this to a file path to append one
+        # line per decision — attach, startup outcome, provider participation,
+        # turn boundary, write result. Useful when a turn produces no entry.
+        # traceFile: /Users/jwalr/.dsh/plugins/current-progress/trace.log
