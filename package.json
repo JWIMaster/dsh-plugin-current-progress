@@ -27,6 +27,9 @@
   "engines": {
     "node": ">=20.3.0"
   },
+  "scripts": {
+    "test": "node --check index.js && node selftest.mjs"
+  },
   "exports": {
     ".": "./index.js",
     "./locale/*.json": "./locale/*.json",
