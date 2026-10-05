@@ -761,9 +761,22 @@ function summarizeCall(argumentsText) {
 	}
 	for (const key of ['command', 'pattern', 'query', 'url', 'description', 'prompt']) {
 		const value = args[key];
-		if (typeof value === 'string' && value.trim().length > 0) return clip(firstLine(value), 120);
+		if (typeof value === 'string' && value.trim().length > 0) return clipInline(firstLine(value), 120);
 	}
 	return '';
+}
+
+/**
+ * Shorten text to a character budget on one line, for content that is rendered
+ * inside a markdown code span (a newline would break it).
+ * @param text - arbitrary text.
+ * @param maxChars - maximum length of the result.
+ * @returns the text, or a single-line elided form.
+ */
+function clipInline(text, maxChars) {
+	const value = String(text ?? '');
+	if (value.length <= maxChars) return value;
+	return `${value.slice(0, maxChars - 1).trimEnd()}…`;
 }
 
 /** Join the text blocks of one message. */
