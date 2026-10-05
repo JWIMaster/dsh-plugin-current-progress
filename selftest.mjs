@@ -255,7 +255,24 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 	check('and leaves a valid default file', h.files.get('/ws/CURRENT_PROGRESS.md')?.includes('_No turn has been recorded yet._') === true);
 }
 
-// 5. A profile without a command service still records turns.
+// 5. A configured file name is what the commands name and act on.
+{
+	const h = harness({ config: { fileName: 'NOTES.md' } });
+	await tick();
+	check('the menu names the configured file', h.registered.get('progress-new').description.includes('NOTES.md'), h.registered.get('progress-new').description);
+	check('and the clear command too', h.registered.get('progress-clear').description.includes('NOTES.md'), h.registered.get('progress-clear').description);
+	const created = await h.run('progress-new');
+	check('the command creates that file', h.files.has('/ws/NOTES.md') && created.text.includes('NOTES.md'), created.text);
+	check('and never the default name', !h.files.has('/ws/CURRENT_PROGRESS.md'));
+	h.feed('turn/start', { turn: 1 });
+	h.feed('user/message', userMessage('rename the notes'));
+	h.feed('assistant/message', { turn: 1, step: 1, message: { id: 'a', role: 'assistant', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text: 'Renamed.' }] } });
+	await h.emit('agent/turn-stopping', { turn: 1 });
+	await tick(5);
+	check('and records into it', h.files.get('/ws/NOTES.md').includes('Renamed.'), h.files.get('/ws/NOTES.md').split('\n').filter((l) => l.startsWith('Summary:')).join(' | '));
+}
+
+// 6. A profile without a command service still records turns.
 {
 	const h = harness({ commands: false });
 	await tick();
@@ -264,7 +281,7 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 	check('the command is simply absent', attempted.kind === 'error', attempted.text);
 }
 
-// 6. The file already exists: it is read into context and appended to.
+// 7. The file already exists: it is read into context and appended to.
 {
 	const existing = '<!-- current-progress: {"version":1,"createdAt":"2026-01-01T00:00:00.000Z"} -->\n# Current Progress\n\n## Entries\n\n<!-- progress:entry id="old:7" -->\n### Turn 7 · earlier\n\nSummary: earlier work\n<!-- /progress:entry -->\n';
 	const h = harness({ initial: { '/ws/CURRENT_PROGRESS.md': existing } });

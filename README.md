@@ -103,7 +103,7 @@ Every value in the patch row's `config` is optional.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `fileName` | `CURRENT_PROGRESS.md` | File name inside the session's working directory (bare name, no separators). |
+| `fileName` | `CURRENT_PROGRESS.md` | File name inside the session's working directory (bare name, no separators). The command menu names this file, so changing it changes what `/progress-new` and `/progress-clear` advertise. |
 | `injectExisting` | `true` | Contribute an existing file to the new session's context. |
 | `recordTurns` | `true` | Append one entry per finished turn. |
 | `maxEntries` | `3` | Retention: only this many of the newest turns are kept. |
@@ -240,7 +240,7 @@ re-parse — the `turn` used for retention is not stored anywhere else.
 
 ```sh
 node --check index.js      # syntax
-node selftest.mjs          # offline harness: 87 behaviour checks
+node selftest.mjs          # offline harness: 92 behaviour checks
 node selftest.mjs --dump   # … and print a generated sample file
 ```
 

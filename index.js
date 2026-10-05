@@ -122,7 +122,7 @@ export function apply(ctx, config = {}) {
 	// Commands act on the directory of whoever invoked them, so the agent that
 	// arrives with the invocation decides which session state is used.
 	const stateOf = (agent) => wired.get(agent)?.state ?? [...wired.values()].find((entry) => entry.state.sessionId === agent?.id)?.state;
-	const disposeCommands = registerCommands(ctx, stateOf, warn);
+	const disposeCommands = registerCommands(ctx, stateOf, warn, () => cfg);
 	ctx.effect(() => () => disposeCommands(), 'current-progress: commands');
 
 	ctx.on('agent/disposed', ({ agent }) => unwire(agent));
@@ -177,6 +177,11 @@ export function apply(ctx, config = {}) {
 			sessionId: agent.id,
 			cwd,
 			cfg,
+			/** Host context and plugin logger. Both are carried here so the free
+			 * functions take the session state they already have, instead of a
+			 * second argument threaded through the whole call chain. */
+			ctx,
+			warn,
 			controller: new AbortController(),
 			closed: false,
 			/** Whether a progress file exists that this session may append to. */
@@ -198,7 +203,7 @@ export function apply(ctx, config = {}) {
 		entry.dispose = wire(ctx, agent, state, warn);
 		trace(cfg, agent.id, 'listeners + context registered');
 
-		await startup(ctx, state);
+		await startup(state);
 	}
 
 	function warn(message) {
@@ -243,14 +248,19 @@ function wire(ctx, agent, state, warn) {
 			try {
 				fold(state, event);
 			} catch (error) {
-				warn(`session fold failed: ${describe(error)}`);
+				// The fold is the only path that sees tool calls, so a failure here
+				// silently costs the turn its entries. Both channels name the event
+				// type, because "the fold failed" alone does not say what broke it.
+				warn(`session fold failed on ${event?.type}: ${describe(error)}`);
+				trace(state.cfg, state.sessionId, `fold failed on ${event?.type}: ${describe(error)}`);
 			}
 		}));
 		attempt('turn-stopping listener', () => agent.ctx.on('agent/turn-stopping', (payload) => {
 			try {
-				return recordTurn(ctx, state, payload);
+				return recordTurn(state, payload);
 			} catch (error) {
 				warn(`could not append a turn entry: ${describe(error)}`);
+				trace(state.cfg, state.sessionId, `turn entry failed: ${describe(error)}`);
 				return undefined;
 			}
 		}));
@@ -278,18 +288,22 @@ function wire(ctx, agent, state, warn) {
 }
 
 /**
- * Look for the progress file and read it, or ask the user to create it.
- * @param ctx - Host plugin context.
+ * Adopt the progress file when the directory already has one.
+ *
+ * The two arms are deliberately asymmetric: a file that exists is read and the
+ * session starts recording into it, while a directory without one is left
+ * exactly as it was. Creating the file is a command, so nothing here can change
+ * a directory the person running the session did not ask to change.
  * @param state - session state.
  */
-async function startup(ctx, state) {
-	const { cfg } = state;
+async function startup(state) {
+	const { cfg, ctx } = state;
 	const signal = state.controller.signal;
 	let target;
 	try {
-		target = await resolveTarget(ctx, state);
+		target = await resolveTarget(state);
 	} catch (error) {
-		warnFor(ctx, `cannot resolve ${cfg.fileName} in "${state.cwd}": ${describe(error)}`);
+		state.warn(`cannot resolve ${cfg.fileName} in "${state.cwd}": ${describe(error)}`);
 		return;
 	}
 
@@ -297,13 +311,13 @@ async function startup(ctx, state) {
 	try {
 		info = await ctx.fs.stat(target, signal);
 	} catch (error) {
-		warnFor(ctx, `cannot inspect ${target.displayPath}: ${describe(error)}`);
+		state.warn(`cannot inspect ${target.displayPath}: ${describe(error)}`);
 		return;
 	}
 	if (state.closed) return;
 
 	if (info !== undefined && info.type !== 'file') {
-		warnFor(ctx, `"${target.displayPath}" exists but is not a regular file; leaving it alone`);
+		state.warn(`"${target.displayPath}" exists but is not a regular file; leaving it alone`);
 		trace(cfg, state.sessionId, `startup: "${target.displayPath}" is not a regular file (${info.type})`);
 		return;
 	}
@@ -314,7 +328,7 @@ async function startup(ctx, state) {
 		try {
 			text = await ctx.fs.readText(target, signal);
 		} catch (error) {
-			warnFor(ctx, `cannot read ${target.displayPath}: ${describe(error)}`);
+			state.warn(`cannot read ${target.displayPath}: ${describe(error)}`);
 			trace(cfg, state.sessionId, `startup: read failed: ${describe(error)}`);
 			return;
 		}
@@ -343,9 +357,10 @@ async function startup(ctx, state) {
  * @param ctx - Host plugin context.
  * @param stateOf - resolves the live wiring of the agent that ran a command.
  * @param warn - plugin logger.
+ * @param cfg - the resolved configuration, whose `fileName` the menu copy names.
  * @returns a disposer of the registrations, if any were made.
  */
-function registerCommands(ctx, stateOf, warn) {
+function registerCommands(ctx, stateOf, warn, cfg) {
 	const commands = ctx.get('commands');
 	if (commands === undefined || typeof commands.register !== 'function') {
 		warn('no command service in this profile; /progress-new and /progress-clear are unavailable');
@@ -361,15 +376,18 @@ function registerCommands(ctx, stateOf, warn) {
 		}
 	};
 
+	// `fileName` is configurable, so the copy names the file the configuration
+	// actually uses. The commands themselves act through the session state, which
+	// owns the resolved configuration; this only keeps the menu honest.
 	register({
 		name: 'progress-new',
-		description: `Create ${DEFAULTS.fileName} for this directory if it is missing`,
-		handler: (invocation) => runCommand(ctx, invocation, stateOf, (state) => createFile(ctx, state))
+		description: `Create ${cfg().fileName} for this directory if it is missing`,
+		handler: (invocation) => runCommand(invocation, stateOf, createFile)
 	});
 	register({
 		name: 'progress-clear',
-		description: `Reset ${DEFAULTS.fileName} to an empty file`,
-		handler: (invocation) => runCommand(ctx, invocation, stateOf, (state) => clearFile(ctx, state))
+		description: `Reset ${cfg().fileName} to an empty file`,
+		handler: (invocation) => runCommand(invocation, stateOf, clearFile)
 	});
 	return () => {
 		for (const off of disposers.splice(0)) {
@@ -389,13 +407,12 @@ function registerCommands(ctx, stateOf, warn) {
  * rather than written to the log: an error outcome is the only place a command
  * can explain itself.
  *
- * @param ctx - Host plugin context.
  * @param invocation - the command invocation.
  * @param stateOf - resolves the live wiring of an agent.
- * @param run - the operation, which returns the text to show.
+ * @param run - the operation, which acts on the state and returns the text to show.
  * @returns the command outcome.
  */
-async function runCommand(ctx, invocation, stateOf, run) {
+async function runCommand(invocation, stateOf, run) {
 	const state = stateOf(invocation.agent);
 	if (state === undefined) {
 		return { kind: 'error', text: 'This session is not tracking progress in this directory.' };
@@ -409,15 +426,14 @@ async function runCommand(ctx, invocation, stateOf, run) {
 
 /**
  * Create the progress file, or report that the directory already has one.
- * @param ctx - Host plugin context.
  * @param state - the invoking session's state.
  * @returns the message to show.
  */
-async function createFile(ctx, state) {
-	const target = await resolveTarget(ctx, state);
-	const info = await ctx.fs.stat(target, state.controller.signal);
+async function createFile(state) {
+	const target = await resolveTarget(state);
+	const info = await state.ctx.fs.stat(target, state.controller.signal);
 	if (info !== undefined) return `${state.cfg.fileName} already exists in this directory; nothing changed.`;
-	await appendEntries(ctx, state, []);
+	await appendEntries(state, []);
 	state.armed = true;
 	state.contextText = createdContext(target, true);
 	trace(state.cfg, state.sessionId, `command: created "${target.displayPath}"`);
@@ -427,16 +443,15 @@ async function createFile(ctx, state) {
 /**
  * Reset the progress file to an empty one, keeping its identity.
  *
- * Pending questions or entries from earlier sessions are dropped: "clear" that
- * left the old turns in place would not be a clear.
+ * The turns recorded by this and earlier sessions are dropped: a clear that left
+ * them in place would not be a clear.
  *
- * @param ctx - Host plugin context.
  * @param state - the invoking session's state.
  * @returns the message to show.
  */
-async function clearFile(ctx, state) {
-	const target = await resolveTarget(ctx, state);
-	await appendEntries(ctx, state, [], { reset: true });
+async function clearFile(state) {
+	const target = await resolveTarget(state);
+	await appendEntries(state, [], { reset: true });
 	state.armed = true;
 	state.createdAt = undefined;
 	state.contextText = createdContext(target, true);
@@ -446,13 +461,12 @@ async function clearFile(ctx, state) {
 
 /**
  * Append (or replace) one turn entry in the progress file.
- * @param ctx - Host plugin context.
  * @param state - session state.
  * @param payload - the closing turn's payload, whose `turn` is authoritative
  *   (a session adopted mid-turn never saw its `turn/start`).
  * @returns the write promise, so the serial turn boundary awaits it.
  */
-function recordTurn(ctx, state, payload) {
+function recordTurn(state, payload) {
 	const current = state.current;
 	state.current = null;
 	const turn = typeof payload?.turn === 'number' ? payload.turn : state.lastTurn;
@@ -470,8 +484,8 @@ function recordTurn(ctx, state, payload) {
 		result: current.result
 	};
 	if (entry.ask.length === 0 && entry.tools.length === 0 && entry.result.trim().length === 0) return undefined;
-	return appendEntries(ctx, state, [entry]).catch((error) => {
-		warnFor(ctx, `could not update ${state.cfg.fileName}: ${describe(error)}`);
+	return appendEntries(state, [entry]).catch((error) => {
+		state.warn(`could not update ${state.cfg.fileName}: ${describe(error)}`);
 	});
 }
 
@@ -488,10 +502,10 @@ function recordTurn(ctx, state, payload) {
  * @param options - `reset` discards the entries already in the file, which is how
  *   `/progress-clear` returns it to a freshly created file.
  */
-async function appendEntries(ctx, state, entries, options = {}) {
-	const { cfg } = state;
+async function appendEntries(state, entries, options = {}) {
+	const { cfg, ctx } = state;
 	const signal = state.controller.signal;
-	const target = await resolveTarget(ctx, state);
+	const target = await resolveTarget(state);
 	for (let attempt = 1; ; attempt += 1) {
 		const info = await ctx.fs.stat(target, signal);
 		const existing = info === undefined ? undefined : await ctx.fs.readText(target, signal);
@@ -509,7 +523,7 @@ async function appendEntries(ctx, state, entries, options = {}) {
 			? { kind: 'createIfAbsent' }
 			: { kind: 'replaceIfVersion', version: info.version };
 		try {
-			await ctx.fs.writeText(target, content, expected, signal, sandboxPolicyOf(ctx, state));
+			await ctx.fs.writeText(target, content, expected, signal, sandboxPolicyOf(state));
 			trace(cfg, state.sessionId, `write: ${expected.kind} -> ${kept.length} entries, ${byteLength(content)} bytes (attempt ${attempt})`);
 			return;
 		} catch (error) {
@@ -524,12 +538,11 @@ async function appendEntries(ctx, state, entries, options = {}) {
 
 /**
  * Resolve the progress file target inside the session's working directory.
- * @param ctx - Host plugin context.
- * @param state - session state.
+ * @param state - session state, which owns the context to resolve through.
  * @returns the opaque filesystem target.
  */
-function resolveTarget(ctx, state) {
-	return ctx.fs.resolve(join(state.cwd, state.cfg.fileName), { cwd: state.cwd, signal: state.controller.signal });
+function resolveTarget(state) {
+	return state.ctx.fs.resolve(join(state.cwd, state.cfg.fileName), { cwd: state.cwd, signal: state.controller.signal });
 }
 
 /**
@@ -539,7 +552,7 @@ function resolveTarget(ctx, state) {
  * @param state - session state.
  * @returns a per-call policy, or `undefined` to let the backend decide.
  */
-function sandboxPolicyOf(ctx, state) {
+function sandboxPolicyOf(state) {
 	try {
 		return ctx.get('sandboxPolicy')?.resolve({ session: state.session });
 	} catch {
@@ -882,7 +895,7 @@ function workLine(tools, cfg) {
 		if (seen.has(key)) continue;
 		seen.add(key);
 		if (CHANGING_TOOLS.has(name) && detail.length > 0) files.push(detail.replace(/`/gu, "'"));
-		else if (name === 'bash' || name === 'pwsh' || name === 'bash-persistent' || name === 'pwsh-persistent') {
+		else if (SHELL_TOOLS.has(name)) {
 			const action = notableAction(tool);
 			if (action !== undefined) actions.push(action);
 		}
@@ -1025,16 +1038,6 @@ function isBlockLine(line) {
  */
 function defuse(text) {
 	return String(text ?? '').replace(/<!--/gu, '&lt;!--').replace(/-->/gu, '--&gt;');
-}
-
-/**
- * Prefix every line of a text block so it stays inside the entry.
- * @param text - arbitrary text recorded from the session, or its lines.
- * @returns the block's lines, already quoted.
- */
-function quote(text) {
-	const source = Array.isArray(text) ? text : String(text).split('\n');
-	return source.map((line) => (String(line).trim().length === 0 ? '>' : `> ${String(line)}`));
 }
 
 /** Strip a `dsh-tool-` style prefix so a name matches its call name. */
@@ -1202,12 +1205,3 @@ function trace(cfg, subject, message) {
 	}
 }
 
-/** Log one warning without letting logging itself break the session. */
-function warnFor(ctx, message) {
-	const logger = ctx.logger ?? console;
-	try {
-		(logger.warn ?? console.warn).call(logger, `current-progress: ${message}`);
-	} catch {
-		/* ignore */
-	}
-}
