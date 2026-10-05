@@ -197,12 +197,17 @@ const userMessage = (text) => ({ id: 'u1', role: 'user', source: { kind: 'user' 
 	check('card: asks the question once', h.asked.length === 1, `asks=${h.asked.length}`);
 	check('card: verb-first question, no stray path', q?.question === 'Record progress in this directory?', q?.question);
 	check('card: short eyebrow header', q?.header === 'Current progress', q?.header);
-	check('card: detail explains the file and who maintains it', /CURRENT_PROGRESS\.md/u.test(q?.detail ?? '') && /never edit it by hand/u.test(q?.detail ?? ''), q?.detail);
-	check('card: detail stays scannable', (q?.detail ?? '').length <= 320, `${(q?.detail ?? '').length} chars`);
+	check('card: detail explains the file and who maintains it', /summary of each turn/u.test(q?.detail ?? '') && /you never edit it by hand/u.test(q?.detail ?? ''), q?.detail);
+	check('card: detail stays scannable', (q?.detail ?? '').length <= 300, `${(q?.detail ?? '').length} chars`);
 	check('card: two options', q?.options?.length === 2, `${q?.options?.length}`);
 	check('card: first option is marked recommended', /\(Recommended\)$/u.test(q?.options?.[0]?.label ?? ''), q?.options?.[0]?.label);
 	check('card: option labels name their action', q?.options?.[0]?.label?.startsWith('Create') === true && q?.options?.[1]?.label === 'Continue without it', q?.options?.map((o) => o.label).join(' | '));
 	check('card: every option carries a description', q?.options?.every((o) => typeof o.description === 'string' && o.description.length > 0) === true);
+	// A description is rendered as a plain string, so markdown syntax in one shows
+	// up as its own characters — the bug this check exists to catch. An underscore
+	// inside a filename is not markup, so only the markers themselves are refused.
+	check('card: no option description implies markup', q?.options?.every((o) => !/[`*[\]]|(^|\s)_|_(\s|$)/u.test(o.description)) === true, q?.options?.map((o) => o.description).join(' | '));
+	check('card: the filename is still named where the choice is made', q?.options?.[0]?.description?.includes('CURRENT_PROGRESS.md') === true, q?.options?.[0]?.description);
 	check('card: decline says the question returns', /next time a session starts here/u.test(q?.options?.[1]?.description ?? ''), q?.options?.[1]?.description);
 	check('card: the recommended option still creates the file', h.files.has('/ws/CURRENT_PROGRESS.md'));
 }

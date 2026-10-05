@@ -381,19 +381,22 @@ async function askToCreate(ctx, state) {
 	if (userQuestions === undefined || typeof userQuestions.ask !== 'function') {
 		return { yes: false, reason: 'no user-questions service in this profile' };
 	}
+	// The detail renders as markdown but an option description does not — it is a
+	// plain string — so a code span in a description ships its backticks as
+	// literal characters. Only the detail may carry markup.
 	const questions = [{
 		id: QUESTION_ID,
 		header: 'Current progress',
 		question: 'Record progress in this directory?',
-		detail: `${cfg.fileName} keeps a short summary of each turn — what was asked, which tools ran, how it ended — so a session opened here later starts with that context instead of a blank slate. This plugin maintains it; you never edit it by hand.`,
+		detail: 'The plugin keeps a short summary of each turn here — what was asked, which tools ran, how it ended — so a session opened in this directory later starts with that context. It maintains the file itself; you never edit it by hand.',
 		options: [
 			{
 				label: `${CREATE_LABEL} (Recommended)`,
-				description: `Create \`${cfg.fileName}\` and update it after every turn.`
+				description: `Create ${cfg.fileName} and update it after every turn.`
 			},
 			{
 				label: DECLINE_LABEL,
-				description: `Write nothing now. This question returns the next time a session starts here.`
+				description: 'Write nothing now. This question returns the next time a session starts here.'
 			}
 		]
 	}];
