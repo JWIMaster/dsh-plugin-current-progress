@@ -65,11 +65,11 @@ that ship, and the version lives in `package.json`.
 # create an empty public repository named dsh-plugin-current-progress at
 # https://github.com/new (no README, no .gitignore — this repo already has both)
 cd ~/.dsh/plugins/current-progress
-git remote add origin https://github.com/JWIMaster/dsh-plugin-current-progress.git
+git remote add origin https://github.com/j-w-i/dsh-plugin-current-progress.git
 git push -u origin main
 ```
 
-Use the SSH form (`git@github.com:JWIMaster/dsh-plugin-current-progress.git`) or
+Use the SSH form (`git@github.com:j-w-i/dsh-plugin-current-progress.git`) or
 a personal access token instead of a password if HTTPS asks for credentials.
 
 ### 2. Publish to npm

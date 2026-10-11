@@ -5,13 +5,13 @@
   "type": "module",
   "license": "MIT",
   "author": "JWI <jwi@j-w-i.org>",
-  "homepage": "https://github.com/JWIMaster/dsh-plugin-current-progress#readme",
+  "homepage": "https://github.com/j-w-i/dsh-plugin-current-progress#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/JWIMaster/dsh-plugin-current-progress.git"
+    "url": "git+https://github.com/j-w-i/dsh-plugin-current-progress.git"
   },
   "bugs": {
-    "url": "https://github.com/JWIMaster/dsh-plugin-current-progress/issues"
+    "url": "https://github.com/j-w-i/dsh-plugin-current-progress/issues"
   },
   "keywords": [
     "dsh",
